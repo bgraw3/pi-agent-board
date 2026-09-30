@@ -374,7 +374,10 @@ export class DashboardComponent implements Component {
 		if (matchesKey(data, Key.ctrl("t"))) return this.togglePin();
 		if (matchesKey(data, Key.ctrl("s"))) return this.stopSelected();
 		if (data === "d") return this.confirmDone();
+		if (data === "d") return this.confirmDone();
+		if (data === "x") return this.confirmDelete();
 		if (data === "h") return this.toggleHold();
+		if (matchesKey(data, Key.ctrl("x"))) return this.handleDeleteKey();
 		if (matchesKey(data, Key.ctrl("x"))) return this.handleDeleteKey();
 		if (data === "X") return this.confirmDeleteState();
 		if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
@@ -1050,6 +1053,27 @@ export class DashboardComponent implements Component {
 		this.notifyInputState(`Press ctrl+x again quickly to delete "${row.meta.name}"${isAgentBusy(row) ? " (stops the active run)" : ""}`, "warning");
 	}
 
+	private confirmDelete(): void {
+		const row = this.selectedRow();
+		if (!row) return;
+		// Confirmation-style delete (issue #150): `x` then `y`, mirroring the
+		// `d`-then-`y` flow. The legacy ctrl+x double-press stays as the
+		// no-confirm shortcut.
+		this.pending = {
+			prompt: `Delete "${row.meta.name}"?${isAgentBusy(row) ? " Stops the active run." : ""} Session file is preserved. (y/N)`,
+			onYes: () => {
+				// archive is async (routes through the view-state coordinator, issue #91);
+				// the notice + refresh land when the command settles.
+				void Promise.resolve(this.deps.service.archive(row.meta.id)).then((res) => {
+					if (!res.ok) this.notice(res.error ?? "Delete failed", "error");
+					else this.notice(`Deleted "${row.meta.name}"`, "info");
+					this.refresh();
+				});
+			},
+		};
+		this.mode = "confirm";
+	}
+
 	private confirmDeleteState(): void {
 		const row = this.selectedRow();
 		if (!row) return;
@@ -1331,7 +1355,7 @@ export class DashboardComponent implements Component {
 			]);
 		}
 		const primary = this.input.trim() ? "enter launch" : live ? "enter attach live" : "enter resume";
-		const hints = ["i insert", primary, "→ attach", "m multi-select", ...(unread > 0 ? [`•${unread} unread`] : []), "d done", "h hold", "space peek", "v transcript", "e evidence", "ctrl+n new session", "ctrl+r rename", "ctrl+x x2 delete", "X delete state", "/ filter", "! pty", "? help"];
+		const hints = ["i insert", primary, "→ attach", "m multi-select", ...(unread > 0 ? [`•${unread} unread`] : []), "d done", "h hold", "space peek", "v transcript", "e evidence", "ctrl+n new session", "ctrl+r rename", "x delete (y/N)", "ctrl+x x2 quick", "X delete state", "/ filter", "! pty", "? help"];
 		if (this.input.trim()) hints.splice(1, 0, "esc clear");
 		return this.hintLine("NORMAL", "muted", hints);
 	}
@@ -1684,6 +1708,7 @@ export class DashboardComponent implements Component {
 			["!", "Open node-pty diagnostics and fix steps"],
 			["ctrl+n", "Open the new-session launch dialog (prompt pre-filled)"],
 			["ctrl+r/t/s", "Rename · pin · stop selected"],
+			["x", "Delete selected session (y/N confirm)"],
 			["ctrl+x x2", "Delete selected session (quick double-press, no confirm)"],
 			["X", "Delete all inactive sessions in selected state"],
 			["v", "Open read-only transcript view"],
