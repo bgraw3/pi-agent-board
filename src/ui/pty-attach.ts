@@ -113,6 +113,7 @@ interface BufferLineLike {
 interface BufferCellLike {
 	getWidth(): number;
 	getChars(): string;
+	hasExtendedAttrs(): number;
 	extended?: { urlId?: number; _urlId?: number };
 	getFgColor(): number;
 	getBgColor(): number;
@@ -1688,6 +1689,8 @@ function clipTerminalLine(line: string, width: number): string {
 }
 
 function osc8UriForCell(term: XtermLike, cell: BufferCellLike): string {
+	// xterm leaves cached extended data on reused cells when this flag is unset.
+	if (!cell.hasExtendedAttrs()) return "";
 	const id = cell.extended?.urlId ?? cell.extended?._urlId ?? 0;
 	if (!id) return "";
 	const service = term._core?._oscLinkService;
