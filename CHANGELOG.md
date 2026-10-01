@@ -5,6 +5,26 @@ conventional commits by `scripts/release_helper.mjs`. Entries are
 forward-only: they begin with the first release after this file landed —
 for earlier history, see the git log and the pull-request list.
 
+## [0.10.0] - 2026-10-01
+
+### Features
+
+- **ui**: x then y confirms session deletion (issue #150) (#152)
+- 8th semantic state holding + manual-fence lift on interactive input (issue #145) (#151)
+
+### Fixes
+
+- **ci**: read the dispatch recovery tag from inputs, not the ref name (issue #154) (#156)
+- job-runner boot-window stop loss + dead-run reconcile convergence (issue #153) (#155)
+- **attach**: answer the color-scheme query client-side for attached sessions (issue #148) (#149)
+
+### Changes
+
+- probe knob guard uses the production-default floor, not a jitter-prone absolute bound (issue #95) (#159)
+- flake postmortems, budget audit gate, ladder knobs (issue #95 F3-F4) (#157)
+
+[0.10.0]: https://github.com/zhuxixi/pi-agent-board/compare/v0.9.0...v0.10.0
+
 ## [0.9.0] - 2026-09-25
 
 ### Features
