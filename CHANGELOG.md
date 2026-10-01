@@ -5,6 +5,14 @@ conventional commits by `scripts/release_helper.mjs`. Entries are
 forward-only: they begin with the first release after this file landed —
 for earlier history, see the git log and the pull-request list.
 
+## [0.10.1] - 2026-10-01
+
+### Fixes
+
+- **attach**: prevent stale hyperlink IDs from leaking across cells (#158)
+
+[0.10.1]: https://github.com/zhuxixi/pi-agent-board/compare/v0.10.0...v0.10.1
+
 ## [0.10.0] - 2026-10-01
 
 ### Features
