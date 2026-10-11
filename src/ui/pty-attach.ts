@@ -12,7 +12,7 @@ import { installImeCursorCoalesce } from "../core/ime-cursor-coalesce.mjs";
 import { createJiggleRetryController } from "../core/pty-attach-jiggle-controller.mjs";
 import { createTerminalAttachClient } from "../core/terminal-attach-client.mjs";
 import { backgroundRgbFromTerminalColors, buildSettleSchemePatch, colorSchemeForBackgroundRgb, extractOscQuerySequences, resolveProbeApi, toColorSchemeReport } from "../core/terminal-query-sequences.mjs";
-import { clampInt, parseMouseInputChunk, resolveAttachMouseAction, resolveWheelLines, scrollViewportTop, selectionDragScrollLines, shouldOwnOuterMouseMode } from "../core/pty-scroll.mjs";
+import { clampInt, parseMouseInputChunk, resolveAttachMouseAction, resolvePasteSelectionSource, resolveWheelLines, scrollViewportTop, selectionDragScrollLines, shouldMirrorSelectionToPrimary, shouldOwnOuterMouseMode } from "../core/pty-scroll.mjs";
 
 export type PtyAttachResult = { action: "detached" } | { action: "closed"; exitCode?: number | null };
 
@@ -374,9 +374,15 @@ export class PtyAttachComponent implements Component {
 	 * middle-click paste is ours; every other event returns undefined so pi's
 	 * own fullscreen selection and the wheel defer path keep working. */
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-		const action = resolveAttachMouseAction(event, {
-			nativePasteEnabled: process.env.AGENT_BOARD_ATTACH_NATIVE_PASTE !== "0",
-		});
+		const nativePasteEnabled = process.env.AGENT_BOARD_ATTACH_NATIVE_PASTE !== "0";
+		if (shouldMirrorSelectionToPrimary(event, { nativePasteEnabled })) {
+			// Observe only — pi's fullscreen selection keeps the event. Mirroring must
+			// run after TuiAltScreen finalizes the selection for this event (overlays
+			// are dispatched before the selection logic), hence the deferred tick.
+			process.nextTick(() => this.mirrorFullscreenSelectionToPrimary());
+			return undefined;
+		}
+		const action = resolveAttachMouseAction(event, { nativePasteEnabled });
 		if (action !== "paste-primary") return undefined;
 		this.clearPendingClick();
 		this.clearSelection();
@@ -1118,15 +1124,16 @@ export class PtyAttachComponent implements Component {
 	}
 
 	/**
-	 * Middle-click paste. Reads the X11 PRIMARY selection via xclip and forwards it to
-	 * the hosted session as input, mimicking the terminal-native middle-click paste that
-	 * mouse reporting (kept on for wheel scrolling) would otherwise swallow. Silent no-op
-	 * when xclip is absent or AGENT_BOARD_ATTACH_NATIVE_PASTE=0.
+	 * Middle-click paste. Reads the X11 selection (PRIMARY by default, or CLIPBOARD via
+	 * AGENT_BOARD_ATTACH_PASTE_SOURCE=clipboard) via xclip and forwards it to the hosted
+	 * session as input, mimicking the terminal-native middle-click paste that mouse
+	 * reporting (kept on for wheel scrolling) would otherwise swallow. Silent no-op when
+	 * xclip is absent or AGENT_BOARD_ATTACH_NATIVE_PASTE=0.
 	 */
 	private pastePrimarySelection(): void {
 		if (process.env.AGENT_BOARD_ATTACH_NATIVE_PASTE === "0") return;
 		try {
-			const child = spawn("xclip", ["-o", "-selection", "primary"], { stdio: ["ignore", "pipe", "ignore"] });
+			const child = spawn("xclip", ["-o", "-selection", resolvePasteSelectionSource(process.env.AGENT_BOARD_ATTACH_PASTE_SOURCE)], { stdio: ["ignore", "pipe", "ignore"] });
 			let out = "";
 			const timer = setTimeout(() => {
 				try {
@@ -1146,6 +1153,19 @@ export class PtyAttachComponent implements Component {
 		} catch {
 			/* silent no-op when xclip is absent — documented contract of this helper */
 		}
+	}
+
+	/** Issue #174 (B2): after a selection gesture ends inside this overlay, copy
+	 * pi's final selection text into the X11 PRIMARY selection so the classic
+	 * select-then-middle-click-paste loop works in fullscreen. Runs on nextTick
+	 * because overlays are dispatched before TuiAltScreen finalizes the
+	 * selection for the same event. No-op in regular mode (no
+	 * getActiveSelectionText) and under the native-paste kill switch. */
+	private mirrorFullscreenSelectionToPrimary(): void {
+		if (this.closed) return;
+		const alt = this.tui as { getActiveSelectionText?: () => string | undefined };
+		const text = alt.getActiveSelectionText?.();
+		if (typeof text === "string" && text.length > 0) this.writePrimarySelection(text);
 	}
 
 	/** Write `text` to the X11 PRIMARY selection so other apps can middle-click-paste it. */
