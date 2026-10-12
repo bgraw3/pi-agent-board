@@ -1,5 +1,6 @@
 // Attach settle scheme probe scenarios (issue #161). Driver: test/pty-attach-settle-scheme.test.mjs.
 import { PtyAttachComponent } from "../src/ui/pty-attach.ts";
+import { feedAttachOutput } from "./attach-output-fixture.ts";
 
 // OSC 11 replies (and pi-tui's parsed reply) carry 0-255 channels, and the
 // luminance threshold sits at ~188 grey, so these pin one answer per scheme.
@@ -35,12 +36,14 @@ async function runSettle(tui: Record<string, unknown>, opts: { env?: Record<stri
 			title: "settle-scheme",
 			onDiagnostic: (event) => captures.diagnostics.push(event),
 		});
+		// SAFETY: Replace only the real component's transport and connection state.
 		const internals = attach as unknown as { send: (m: { type: string; data?: string }) => void; finishAttachTransition: () => void; connected: boolean };
 		internals.send = (m) => { if (m?.type === "input" && m.data) captures.sent.push(m.data); };
 		// Production settle runs after the control socket connected; the smoke
 		// never connects (fake socket), so reflect the real delivery state here.
 		// The disconnected corner has its own scenario below.
 		internals.connected = true;
+		await feedAttachOutput(attach, "\x1b[?2004h", "snapshot");
 		internals.finishAttachTransition();
 		await new Promise((r) => setImmediate(r));
 		return captures;
@@ -78,13 +81,16 @@ async function runLateScenario(kind: "same" | "different" | "afterTimeout" | "cl
 			title: "settle-scheme-late",
 			onDiagnostic: (event) => captures.diagnostics.push(event),
 		});
+		// SAFETY: Replace only the real component's transport and connection state.
 		const internals = attach as unknown as { send: (m: { type: string; data?: string }) => void; finishAttachTransition: () => void; connected: boolean };
 		internals.send = (m) => { if (m?.type === "input" && m.data) captures.sent.push(m.data); };
-		// Same as runSettle: late scenarios deliver over a connected socket.
+		// Same as runSettle: late scenarios deliver to a raw-mode child.
 		internals.connected = true;
+		await feedAttachOutput(attach, "\x1b[?2004h", "snapshot");
 		internals.finishAttachTransition();
 		await new Promise((r) => setImmediate(r));
 		// "closed" drops the late reply (already-delivered 997;2 stays).
+		// SAFETY: Invoke the component's real close path to test late-reply teardown.
 		if (kind === "closed") (attach as unknown as { close(): void }).close();
 		// "same" dedups against the LIGHT just sent; "different"/"afterTimeout"
 		// deliver DARK (sentScheme starts null, so a timeout-then-late still sends).
@@ -146,6 +152,7 @@ out.lateClosed = dump(await runLateScenario("closed"));
 			title: "settle-scheme-disc",
 			onDiagnostic: (event) => captures.diagnostics.push(event),
 		});
+		// SAFETY: Replace only the real component's transport; keep it disconnected.
 		const internals = attach as unknown as { send: (m: { type: string; data?: string }) => void; finishAttachTransition: () => void };
 		internals.send = (m) => { if (m?.type === "input" && m.data) captures.sent.push(m.data); };
 		// connected stays false — the corner under test.
