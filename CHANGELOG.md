@@ -5,6 +5,14 @@ conventional commits by `scripts/release_helper.mjs`. Entries are
 forward-only: they begin with the first release after this file landed —
 for earlier history, see the git log and the pull-request list.
 
+## [0.11.0] - 2026-10-12
+
+### Features
+
+- **attach**: mirror pi's fullscreen selection into X11 PRIMARY + paste-source override (#177)
+
+[0.11.0]: https://github.com/zhuxixi/pi-agent-board/compare/v0.10.2...v0.11.0
+
 ## [0.10.2] - 2026-10-10
 
 ### Fixes
