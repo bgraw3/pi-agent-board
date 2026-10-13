@@ -5,6 +5,14 @@ conventional commits by `scripts/release_helper.mjs`. Entries are
 forward-only: they begin with the first release after this file landed —
 for earlier history, see the git log and the pull-request list.
 
+## [0.11.1] - 2026-10-13
+
+### Fixes
+
+- **attach**: defer color-scheme reports until child input is ready (#180)
+
+[0.11.1]: https://github.com/zhuxixi/pi-agent-board/compare/v0.11.0...v0.11.1
+
 ## [0.11.0] - 2026-10-12
 
 ### Features
