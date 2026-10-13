@@ -240,6 +240,12 @@ export class PtyAttachComponent implements Component {
 	// null never matches the duplicate check, so a timeout-then-late sequence
 	// still delivers. Single-shot per attach — settle runs at most once.
 	private sentScheme: TerminalColorScheme | null = null;
+	// Pi enables bracketed paste AFTER entering raw mode and disables it at
+	// shutdown. Only current runner output/snapshots may establish readiness;
+	// the screen.log warm-start can belong to a previous child incarnation.
+	private childInputReady = false;
+	private childInputModeCarry = "";
+	private pendingSchemeReport: { scheme: TerminalColorScheme; api?: "colors" | "background" | "none"; late?: boolean } | null = null;
 	// Issue #128 D2: unsubscriber for the color-scheme bridge registered at
 	// attach settle; nulled on every terminal path so the TUI never keeps a
 	// listener pointing at a dead attach surface.
@@ -469,7 +475,7 @@ export class PtyAttachComponent implements Component {
 		this.parserBuffer = "";
 		socket.on("connect", () => {
 			if (this.socket !== socket) {
-				try { socket.destroy(); } catch {}
+				try { socket.destroy(); } catch { /* best-effort stale-socket cleanup */ }
 				return;
 			}
 			this.clearRetry();
@@ -520,7 +526,7 @@ export class PtyAttachComponent implements Component {
 			// The error may belong to an old socket after reconnect. Dispose that
 			// socket, but do not alter the state of the current connection.
 			if (this.socket !== socket) {
-				try { socket.destroy(); } catch {}
+				try { socket.destroy(); } catch { /* best-effort stale-socket cleanup */ }
 				return;
 			}
 			this.socket = null;
@@ -529,7 +535,7 @@ export class PtyAttachComponent implements Component {
 			// stale-socket guard (this.socket no longer matches) and must not be
 			// the only path that cancels the probe deadline (CR R1 advisory).
 			this.attachClient.onDisconnect();
-			try { socket.destroy(); } catch {}
+			try { socket.destroy(); } catch { /* already handling socket failure */ }
 			this.disconnectedAt ??= Date.now();
 			if (this.closed) return;
 			this.status = `waiting for host… ${err.message}`;
@@ -653,8 +659,9 @@ export class PtyAttachComponent implements Component {
 		if (this.colorSchemeBridgeUnsubscribe) return;
 		try {
 			this.colorSchemeBridgeUnsubscribe = this.tui.onTerminalColorSchemeChange((scheme) => {
-				const data = toColorSchemeReport(scheme);
-				if (data) this.send({ type: "input", data });
+				if (!toColorSchemeReport(scheme)) return;
+				this.pendingSchemeReport = { scheme };
+				this.flushPendingSchemeReport();
 			});
 		} catch {
 			/* best-effort: an unbridgeable TUI keeps pre-#128 behavior */
@@ -664,6 +671,8 @@ export class PtyAttachComponent implements Component {
 	/** Called on every terminal path (close() covers detach/dispose; the exit
 	 * branch calls done() without close(), so it unsubscribes explicitly). */
 	private detachColorSchemeBridge(): void {
+		this.pendingSchemeReport = null;
+		this.childInputReady = false;
 		const unsubscribe = this.colorSchemeBridgeUnsubscribe;
 		this.colorSchemeBridgeUnsubscribe = null;
 		if (!unsubscribe) return;
@@ -728,7 +737,8 @@ export class PtyAttachComponent implements Component {
 		const rgb = backgroundRgbFromTerminalColors(colors as never);
 		const scheme = rgb ? colorSchemeForBackgroundRgb(rgb) ?? undefined : undefined;
 		if (!scheme) return;
-		if (this.sentScheme === scheme) {
+		if (this.sentScheme === scheme && this.childInputReady) {
+			this.pendingSchemeReport = null;
 			this.opts.onDiagnostic?.(buildSettleSchemePatch({ probeApi: api, outcome: "duplicate_skipped" }));
 			return;
 		}
@@ -748,6 +758,12 @@ export class PtyAttachComponent implements Component {
 			this.opts.onDiagnostic?.(buildSettleSchemePatch({ probeApi: api, outcome: "dropped_disconnected" }));
 			return;
 		}
+		if (!this.childInputReady) {
+			// Settle/probe completion is not a child-readiness handshake. Keep
+			// only the latest scheme, then send when the child enters raw mode.
+			this.pendingSchemeReport = { scheme, api, late };
+			return;
+		}
 		this.sentScheme = scheme;
 		this.send({ type: "input", data });
 		const details: { probeApi: "colors" | "background" | "none"; outcome: "reported"; report: string; late?: boolean } = {
@@ -757,6 +773,26 @@ export class PtyAttachComponent implements Component {
 		};
 		if (late) details.late = true;
 		this.opts.onDiagnostic?.(buildSettleSchemePatch(details));
+	}
+
+	private updateChildInputReadiness(data: string): void {
+		// Scan only LIVE bytes, not warm-start history. A reused xterm buffer
+		// can still have the old child's paste mode enabled during cold boot.
+		const input = this.childInputModeCarry + data;
+		for (const match of input.matchAll(/\x1b\[\?2004([hl])/g)) {
+			this.childInputReady = match[1] === "h";
+		}
+		// Keep at most an incomplete eight-byte mode sequence across chunks.
+		this.childInputModeCarry = input.slice(-7);
+	}
+
+	private flushPendingSchemeReport(): void {
+		if (this.closed || !this.connected || !this.childInputReady) return;
+		const pending = this.pendingSchemeReport;
+		this.pendingSchemeReport = null;
+		if (!pending) return;
+		if (pending.api) this.deliverSettleScheme(pending.scheme, pending.api, pending.late ?? false);
+		else this.send({ type: "input", data: toColorSchemeReport(pending.scheme) });
 	}
 
 	private startDesyncProbe(): void {
@@ -1411,8 +1447,12 @@ export class PtyAttachComponent implements Component {
 			// constructor's screen.log warm-start must not outlive the protocol
 			// answer — a gated reset let the dead session's tail render as a
 			// cold-start ghost once the banner lifted (final-review F1).
-			if (typeof snap.frame === "string") this.pushOutput(snap.frame);
-			else if (snap.empty || snap.resnapshot) this.term.reset();
+			if (typeof snap.frame === "string") this.pushOutput(snap.frame, { authoritative: true });
+			else if (snap.empty || snap.resnapshot) {
+				this.childInputReady = false;
+				this.childInputModeCarry = "";
+				this.term.reset();
+			}
 			return;
 		}
 		if (event === "output") {
@@ -1421,6 +1461,10 @@ export class PtyAttachComponent implements Component {
 			// protocol mode.
 			if (typeof payload === "string") this.pushOutput(payload, { forwardProtocols: true });
 			return;
+		}
+		if (event === "epochReset") {
+			this.childInputReady = false;
+			this.childInputModeCarry = "";
 		}
 		// "resubscribing": recovery is client-internal (informational only).
 		// "protocolError": observability only — recovery is automatic until the
@@ -1500,11 +1544,19 @@ export class PtyAttachComponent implements Component {
 		}
 	}
 
-	private pushOutput(data: string, opts: { forwardProtocols?: boolean } = {}): void {
+	private pushOutput(data: string, opts: { forwardProtocols?: boolean; authoritative?: boolean } = {}): void {
 		if (data.length === 0) return;
 		// Recorded synchronously BEFORE term.write (whose callback is async): the
 		// desync quiet-window must measure when output ARRIVED, not when parsing finished.
 		this.lastOutputAt = this.nowFn();
+		// Current snapshots explicitly restore all modes, including paste mode.
+		// Read their readiness synchronously so an older parse callback cannot
+		// overwrite a newer live shutdown/reload signal.
+		if (opts.authoritative) {
+			this.childInputReady = false;
+			this.childInputModeCarry = "";
+		}
+		if (opts.forwardProtocols || opts.authoritative) this.updateChildInputReadiness(data);
 		if (opts.forwardProtocols) this.forwardTerminalProtocols(data);
 		// @xterm/headless parses asynchronously; the buffer is only populated once this
 		// callback fires. Mark the buffer as ready (so the project path can paint it), but
@@ -1513,6 +1565,7 @@ export class PtyAttachComponent implements Component {
 		// chunk also defers the settle window, so the banner holds until output actually
 		// stops arriving (i.e. the redraw finished), not just until the resize jiggle ends.
 		this.term.write(data, () => {
+			if (opts.forwardProtocols || opts.authoritative) this.flushPendingSchemeReport();
 			this.receivedOutput = true;
 			this.deferAttachSettle();
 			this.outputRenderScheduler.request();
@@ -1573,16 +1626,16 @@ export class PtyAttachComponent implements Component {
 		this.connected = false;
 		if (!socket) return;
 		if (!gracefulSocket) {
-			try { socket.destroy(); } catch {}
+			try { socket.destroy(); } catch { /* best-effort teardown */ }
 			return;
 		}
 		// socket.end() preserves the ordering of the already-buffered restore and
 		// detach packets. destroy() would discard buffered writes under backpressure.
 		socket.once("close", () => this.clearGracefulSocketCloseTimer());
-		try { socket.end(); } catch {}
+		try { socket.end(); } catch { /* fallback timer below forces cleanup */ }
 		this.gracefulSocketCloseTimer = setTimeout(() => {
 			this.gracefulSocketCloseTimer = null;
-			try { socket.destroy(); } catch {}
+			try { socket.destroy(); } catch { /* best-effort teardown */ }
 		}, GRACEFUL_SOCKET_CLOSE_MS);
 		this.gracefulSocketCloseTimer.unref?.();
 	}

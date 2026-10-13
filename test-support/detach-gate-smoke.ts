@@ -28,8 +28,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { once } from "node:events";
 import { PtyAttachComponent } from "../src/ui/pty-attach.ts";
+import { feedAttachOutput, fixtureInternals } from "./attach-output-fixture.ts";
 
 const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 const keybindings = {} as never;
@@ -84,7 +84,7 @@ function makeAttach(options: { backgroundReplies?: Array<{ r: number; g: number;
 		{ socketPath: "/no/such/socket", title: "gate" },
 	);
 	const sent: Array<Record<string, unknown>> = [];
-	(attach as unknown as { send: (msg: Record<string, unknown>) => void }).send = (msg) => sent.push(msg);
+	(fixtureInternals<{ send: (msg: Record<string, unknown>) => void }>(attach)).send = (msg) => sent.push(msg);
 	return {
 		attach,
 		sent,
@@ -101,9 +101,9 @@ function countWrites(writes: string[], needle: string): number {
 
 async function writeToTerm(attach: PtyAttachComponent, data: string): Promise<void> {
 	await new Promise<void>((resolve) => {
-		(attach as unknown as { term: { write: (d: string, cb: () => void) => void } }).term.write(data, resolve);
+		(fixtureInternals<{ term: { write: (d: string, cb: () => void) => void } }>(attach)).term.write(data, resolve);
 	});
-	(attach as unknown as { receivedOutput: boolean }).receivedOutput = true;
+	(fixtureInternals<{ receivedOutput: boolean }>(attach)).receivedOutput = true;
 }
 
 async function poisonCursorLine(attach: PtyAttachComponent): Promise<void> {
@@ -140,7 +140,7 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n> \x1b[7m草\x1b[27m稿");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[D");
 	out.leftStaysGatedOnNonEmptyLine = !didDetach() && sent.length === 1 && sent[0].type === "input" && sent[0].data === "\x1b[D";
 	attach.dispose();
@@ -154,7 +154,7 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await poisonCursorLine(attach);
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[D");
 	out.leftForwardsOnGarbledBufferWithoutEditorState = !didDetach() && sent.length === 1 && sent[0].type === "input" && sent[0].data === "\x1b[D";
 	attach.dispose();
@@ -167,7 +167,7 @@ const out: Record<string, boolean> = {};
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n> \x1b[7m \x1b[27m");
 	await writeToTerm(attach, "\x1b[3;1H⠙ Working...");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[D");
 	out.leftForwardsOnEmptyEditorLineWithoutEditorState = !didDetach() && sent.length === 1 && sent[0].type === "input" && sent[0].data === "\x1b[D";
 	attach.dispose();
@@ -214,20 +214,26 @@ const out: Record<string, boolean> = {};
 		destroy() { wire.push("DESTROY"); },
 		once(_event: string, _listener: () => void) { return this; },
 	};
-	const internals = attach as unknown as {
+	const internals = fixtureInternals<{
 		socket: typeof socket | null;
 		connected: boolean;
 		receivedOutput: boolean;
 		jiggleRetry: { start: (cols: number, rows: number) => void };
-	};
+	}>(attach);
 	internals.socket = socket;
 	internals.connected = true;
 	internals.receivedOutput = false;
 	internals.jiggleRetry.start(80, 22);
-	(attach as unknown as { onSocketData: (t: string) => void }).onSocketData(JSON.stringify({ type: "editor_state", empty: true }) + "\n");
+	(fixtureInternals<{ onSocketData: (t: string) => void }>(attach)).onSocketData(JSON.stringify({ type: "editor_state", empty: true }) + "\n");
 	wire.length = 0;
 	attach.handleInput("\x1b[D");
-	const packets = wire.filter((entry) => entry !== "END" && entry !== "DESTROY").map((entry) => JSON.parse(entry));
+	const packets = wire.filter((entry) => entry !== "END" && entry !== "DESTROY").map((entry) => {
+		try {
+			return JSON.parse(entry);
+		} catch (error) {
+			throw new Error("attach emitted an invalid JSON control packet", { cause: error });
+		}
+	});
 	out.leftDetachRestoresBeforeGracefulEnd = packets.length === 2 && packets[0].type === "resize" && packets[0].cols === 80 && packets[0].rows === 22 && packets[1].type === "detach" && wire.at(-1) === "END" && !wire.includes("DESTROY");
 	attach.dispose();
 }
@@ -239,7 +245,7 @@ const out: Record<string, boolean> = {};
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n");
 	await writeToTerm(attach, "\x1b[1;1H"); // park the cursor on the non-empty line
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[D");
 	out.leftForwardsWithoutEditorStateEvenOnEmptyLookingBuffer = !didDetach() && sent.length === 1 && sent[0].type === "input" && sent[0].data === "\x1b[D";
 	attach.dispose();
@@ -252,7 +258,7 @@ const out: Record<string, boolean> = {};
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n> ");
 	await writeToTerm(attach, "\x1b[1;1H"); // park the cursor on the non-empty line
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[D");
 	out.leftForwardsOnGlyphLineWithoutEditorState = !didDetach() && sent.length === 1 && sent[0].type === "input" && sent[0].data === "\x1b[D";
 	attach.dispose();
@@ -263,8 +269,8 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n> \x1b[7m草\x1b[27m稿");
-	(attach as unknown as { onSocketData: (t: string) => void }).onSocketData(JSON.stringify({ type: "editor_state", empty: true }) + "\n");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ onSocketData: (t: string) => void }>(attach)).onSocketData(JSON.stringify({ type: "editor_state", empty: true }) + "\n");
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[D");
 	out.leftDetachesWhenEditorStateReportsEmpty = didDetach() && sent.length === 1 && sent[0].type === "detach";
 	attach.dispose();
@@ -276,8 +282,8 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n");
-	(attach as unknown as { onSocketData: (t: string) => void }).onSocketData(JSON.stringify({ type: "editor_state", empty: false }) + "\n");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ onSocketData: (t: string) => void }>(attach)).onSocketData(JSON.stringify({ type: "editor_state", empty: false }) + "\n");
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[D");
 	out.leftForwardsWhenEditorStateReportsDraft = !didDetach() && sent.length === 1 && sent[0].type === "input" && sent[0].data === "\x1b[D";
 	attach.dispose();
@@ -290,9 +296,9 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n> \x1b[7m草\x1b[27m稿");
-	(attach as unknown as { onSocketData: (t: string) => void }).onSocketData(JSON.stringify({ type: "editor_state", empty: true }) + "\n");
-	(attach as unknown as { onSocketData: (t: string) => void }).onSocketData(JSON.stringify({ type: "hello", editorEmpty: null }) + "\n");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ onSocketData: (t: string) => void }>(attach)).onSocketData(JSON.stringify({ type: "editor_state", empty: true }) + "\n");
+	(fixtureInternals<{ onSocketData: (t: string) => void }>(attach)).onSocketData(JSON.stringify({ type: "hello", editorEmpty: null }) + "\n");
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[D");
 	out.leftHelloNullResetsStaleEditorState = !didDetach() && sent.length === 1 && sent[0].type === "input" && sent[0].data === "\x1b[D";
 	attach.dispose();
@@ -305,7 +311,7 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n│ Issue #778 │ open │\r\n> quote line\r\n");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[D");
 	out.leftForwardsOnTableRowsWithoutEditorState = !didDetach() && sent.length === 1 && sent[0].type === "input" && sent[0].data === "\x1b[D";
 	attach.dispose();
@@ -318,7 +324,7 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n> draft\r\n");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[D");
 	out.leftForwardsOnContentGlyphWithoutEditorState = !didDetach() && sent.length === 1 && sent[0].type === "input" && sent[0].data === "\x1b[D";
 	attach.dispose();
@@ -331,7 +337,7 @@ const out: Record<string, boolean> = {};
 	const { attach, sent, didDetach } = makeAttach();
 	const DIFF_LINE = "\x1b[48;2;230;233;239m \x1b[38;2;64;160;43m+ 65 ## \x1b[7mR2 · \x1b[27m#\x1b[7m822 新 step 挂链顺序调研\x1b[27m";
 	await writeToTerm(attach, "chat\r\n" + DIFF_LINE + "\r\n  ");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[D");
 	out.leftForwardsWithDiffHighlightWithoutEditorState = !didDetach() && sent.length === 1 && sent[0].type === "input" && sent[0].data === "\x1b[D";
 	attach.dispose();
@@ -342,7 +348,7 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat\r\n\x1b[7m Session saved \x1b[27m\r\n  ");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[D");
 	out.leftForwardsWithInverseBannerWithoutEditorState = !didDetach() && sent.length === 1 && sent[0].type === "input" && sent[0].data === "\x1b[D";
 	attach.dispose();
@@ -356,7 +362,7 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n\x1b[7m草\x1b[27m稿");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[D");
 	out.leftForwardsOnNewStyleDraftWithoutReporter = !didDetach() && sent.length === 1 && sent[0].type === "input" && sent[0].data === "\x1b[D";
 	attach.dispose();
@@ -368,8 +374,8 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n");
-	(attach as unknown as { onSocketData: (t: string) => void }).onSocketData(JSON.stringify({ type: "editor_state", empty: false }) + "\n");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ onSocketData: (t: string) => void }>(attach)).onSocketData(JSON.stringify({ type: "editor_state", empty: false }) + "\n");
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[1;5D");
 	out.ctrlLeftDetachesOnDraft = didDetach() && sent.length === 1 && sent[0].type === "detach";
 	attach.dispose();
@@ -380,7 +386,7 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n> \x1b[7m \x1b[27m");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[1;5D");
 	out.ctrlLeftDetachesOnEmptyInput = didDetach() && sent.length === 1 && sent[0].type === "detach";
 	attach.dispose();
@@ -404,8 +410,8 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n");
-	(attach as unknown as { onSocketData: (t: string) => void }).onSocketData(JSON.stringify({ type: "editor_state", empty: false }) + "\n");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ onSocketData: (t: string) => void }>(attach)).onSocketData(JSON.stringify({ type: "editor_state", empty: false }) + "\n");
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1c");
 	out.ctrlBackslashDetachesOnDraft = didDetach() && sent.length === 1 && sent[0].type === "detach";
 	attach.dispose();
@@ -415,8 +421,8 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n");
-	(attach as unknown as { onSocketData: (t: string) => void }).onSocketData(JSON.stringify({ type: "editor_state", empty: true }) + "\n");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ onSocketData: (t: string) => void }>(attach)).onSocketData(JSON.stringify({ type: "editor_state", empty: true }) + "\n");
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1c");
 	out.ctrlBackslashDetachesOnEmptyEditor = didDetach() && sent.length === 1 && sent[0].type === "detach";
 	attach.dispose();
@@ -427,7 +433,7 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1c");
 	out.ctrlBackslashDetachesWithoutEditorState = didDetach() && sent.length === 1 && sent[0].type === "detach";
 	attach.dispose();
@@ -449,8 +455,8 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n");
-	(attach as unknown as { onSocketData: (t: string) => void }).onSocketData(JSON.stringify({ type: "editor_state", empty: false }) + "\n");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ onSocketData: (t: string) => void }>(attach)).onSocketData(JSON.stringify({ type: "editor_state", empty: false }) + "\n");
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[92;5u");
 	out.ctrlBackslashDetachesViaKittyEncoding = didDetach() && sent.length === 1 && sent[0].type === "detach";
 	attach.dispose();
@@ -461,8 +467,8 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n");
-	(attach as unknown as { onSocketData: (t: string) => void }).onSocketData(JSON.stringify({ type: "editor_state", empty: false }) + "\n");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ onSocketData: (t: string) => void }>(attach)).onSocketData(JSON.stringify({ type: "editor_state", empty: false }) + "\n");
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("\x1b[27;5;92~");
 	out.ctrlBackslashDetachesViaModifyOtherKeys = didDetach() && sent.length === 1 && sent[0].type === "detach";
 	attach.dispose();
@@ -473,8 +479,8 @@ const out: Record<string, boolean> = {};
 {
 	const { attach, sent, didDetach } = makeAttach();
 	await writeToTerm(attach, "chat content\r\n");
-	(attach as unknown as { onSocketData: (t: string) => void }).onSocketData(JSON.stringify({ type: "editor_state", empty: false }) + "\n");
-	(attach as unknown as { connected: boolean }).connected = true;
+	(fixtureInternals<{ onSocketData: (t: string) => void }>(attach)).onSocketData(JSON.stringify({ type: "editor_state", empty: false }) + "\n");
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
 	attach.handleInput("q");
 	out.printableQStillForwardsToChild = !didDetach() && sent.length === 1 && sent[0].type === "input" && sent[0].data === "q";
 	attach.dispose();
@@ -486,7 +492,7 @@ const out: Record<string, boolean> = {};
 // production forwarding entry point (pushOutput with forwardProtocols).
 {
 	const { attach, terminalWrites } = makeAttach();
-	const push = (attach as unknown as { pushOutput: (d: string, o?: { forwardProtocols?: boolean }) => void });
+	const push = (fixtureInternals<{ pushOutput: (d: string, o?: { forwardProtocols?: boolean }) => void }>(attach));
 	push.pushOutput("hello\x1b]11;?\x07world", { forwardProtocols: true });
 	push.pushOutput("\x1b]11;rgb:ffff/ffff/ffff\x07", { forwardProtocols: true });
 	push.pushOutput("\x1b[?2031h", { forwardProtocols: true });
@@ -501,7 +507,9 @@ const out: Record<string, boolean> = {};
 // unsubscribe (no leaked listener) and silence further sends.
 {
 	const { attach, sent, scopedTui } = makeAttach();
-	(attach as unknown as { finishAttachTransition: () => void }).finishAttachTransition();
+	(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
+	await feedAttachOutput(attach, "\x1b[?2004h", "snapshot");
+	(fixtureInternals<{ finishAttachTransition: () => void }>(attach)).finishAttachTransition();
 	scopedTui.fireColorScheme("light");
 	out.schemeBridgeSendsReport = sent.length === 1 && sent[0].type === "input" && sent[0].data === "\x1b[?997;2n";
 	attach.handleInput("\x1c");
@@ -517,7 +525,8 @@ const out: Record<string, boolean> = {};
 // remains a no-op; the kill switch silences forwarding, the probe, and the bridge.
 {
 	const { attach, terminalWrites, backgroundProbeCalls } = makeAttach();
-	const settle = (attach as unknown as { finishAttachTransition: () => void });
+	await feedAttachOutput(attach, "\x1b[?2004h", "snapshot");
+	const settle = (fixtureInternals<{ finishAttachTransition: () => void }>(attach));
 	settle.finishAttachTransition();
 	settle.finishAttachTransition();
 	out.settleUsesOnlyTrackedProbe = backgroundProbeCalls.length === 1 && countWrites(terminalWrites, "\x1b]11;?\x07") === 1;
@@ -526,9 +535,9 @@ const out: Record<string, boolean> = {};
 	process.env.AGENT_BOARD_FORWARD_TERMINAL_QUERIES = "0";
 	try {
 		const killed = makeAttach();
-		const killPush = (killed.attach as unknown as { pushOutput: (d: string, o?: { forwardProtocols?: boolean }) => void });
+		const killPush = (fixtureInternals<{ pushOutput: (d: string, o?: { forwardProtocols?: boolean }) => void }>(killed.attach));
 		killPush.pushOutput("\x1b]11;?\x07", { forwardProtocols: true });
-		(killed.attach as unknown as { finishAttachTransition: () => void }).finishAttachTransition();
+		(fixtureInternals<{ finishAttachTransition: () => void }>(killed.attach)).finishAttachTransition();
 		out.killSwitchSilencesQueriesAndProbe = !killed.terminalWrites.some((w) => w.includes("\x1b]11;?\x07"));
 		out.killSwitchSkipsBridge = killed.scopedTui.listenerCount() === 0;
 		killed.attach.dispose();
@@ -542,7 +551,7 @@ const out: Record<string, boolean> = {};
 // flags would retune the shared real-terminal keyboard stack.
 {
 	const { attach, terminalWrites } = makeAttach();
-	(attach as unknown as { pushOutput: (d: string, o?: { forwardProtocols?: boolean }) => void }).pushOutput("\x1b[>7u\x1b[?u\x1b[c", { forwardProtocols: true });
+	(fixtureInternals<{ pushOutput: (d: string, o?: { forwardProtocols?: boolean }) => void }>(attach)).pushOutput("\x1b[>7u\x1b[?u\x1b[c", { forwardProtocols: true });
 	out.kittyNegotiationNotForwarded = !terminalWrites.some((w) => w.includes("\x1b[>7u") || w.includes("\x1b[?u") || w.includes("\x1b[c"));
 	attach.dispose();
 }
@@ -552,24 +561,25 @@ const out: Record<string, boolean> = {};
 // report, so a child stuck on Pi's leaked pending-query state (a timed-out
 // probe swallows the next arriving reply) still resolves the right theme.
 {
-	const settle = (attach: PtyAttachComponent) => {
+	const settle = async (attach: PtyAttachComponent) => {
 		// Production settle delivers over a connected control socket; the fake
 		// socket never connects, so mirror the connected state here (makeAttach
 		// leaves it false for the socket-down escape scenarios).
-		(attach as unknown as { connected: boolean }).connected = true;
-		(attach as unknown as { finishAttachTransition: () => void }).finishAttachTransition();
+		(fixtureInternals<{ connected: boolean }>(attach)).connected = true;
+		await feedAttachOutput(attach, "\x1b[?2004h", "snapshot");
+		(fixtureInternals<{ finishAttachTransition: () => void }>(attach)).finishAttachTransition();
 	};
 
 	// Light reply (Catppuccin Latte background) must become a 997;2 report.
 	const light = makeAttach({ backgroundReplies: [{ r: 239, g: 241, b: 245 }] });
-	settle(light.attach);
+	await settle(light.attach);
 	const lightReported = await waitFor(() => light.sent.length === 1, 1000);
 	out.settleProbeReportsRealTerminalScheme = lightReported && light.sent[0].type === "input" && light.sent[0].data === "\x1b[?997;2n";
 	light.attach.dispose();
 
 	// A dark reply maps to 997;1 (the pair the host's parser round-trips).
 	const dark = makeAttach({ backgroundReplies: [{ r: 30, g: 30, b: 46 }] });
-	settle(dark.attach);
+	await settle(dark.attach);
 	const darkReported = await waitFor(() => dark.sent.length === 1, 1000);
 	out.settleProbeReportsDarkScheme = darkReported && dark.sent[0].data === "\x1b[?997;1n";
 	dark.attach.dispose();
@@ -578,7 +588,7 @@ const out: Record<string, boolean> = {};
 	// timed-out probe would leave a settled entry in the local pi-tui's queue and
 	// eat the next reply (CR round-1 advisory). No answer => silence.
 	const silent = makeAttach({ backgroundReplies: [undefined] });
-	settle(silent.attach);
+	await settle(silent.attach);
 	await new Promise((resolve) => setTimeout(resolve, 50));
 	out.settleProbeIsSingleShotWithoutAnswer = silent.sent.length === 0 && silent.backgroundProbeCalls.length === 1;
 	silent.attach.dispose();
@@ -587,7 +597,7 @@ const out: Record<string, boolean> = {};
 	process.env.AGENT_BOARD_FORWARD_TERMINAL_QUERIES = "0";
 	try {
 		const killed = makeAttach({ backgroundReplies: [{ r: 239, g: 241, b: 245 }] });
-		settle(killed.attach);
+		await settle(killed.attach);
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		out.killSwitchSkipsSchemeProbe = killed.backgroundProbeCalls.length === 0 && killed.sent.length === 0;
 		killed.attach.dispose();
@@ -604,8 +614,9 @@ const out: Record<string, boolean> = {};
 {
 	const newApi = makeAttach({ queryVia: "colors", backgroundReplies: [{ r: 239, g: 241, b: 245 }] });
 	// Same as P12's settle helper: deliver over a connected control socket.
-	(newApi.attach as unknown as { connected: boolean }).connected = true;
-	(newApi.attach as unknown as { finishAttachTransition: () => void }).finishAttachTransition();
+	(fixtureInternals<{ connected: boolean }>(newApi.attach)).connected = true;
+	await feedAttachOutput(newApi.attach, "\x1b[?2004h", "snapshot");
+	(fixtureInternals<{ finishAttachTransition: () => void }>(newApi.attach)).finishAttachTransition();
 	const reported = await waitFor(() => newApi.sent.length === 1, 1000);
 	out.settleProbeNewApiReportsRealTerminalScheme = reported && newApi.sent[0].type === "input" && newApi.sent[0].data === "\x1b[?997;2n";
 	newApi.attach.dispose();
@@ -615,11 +626,11 @@ const out: Record<string, boolean> = {};
 // runner immediately clamps back, because that is not a real width delta.
 {
 	const { attach } = makeAttach();
-	const internals = attach as unknown as {
+	const internals = fixtureInternals<{
 		jiggleRetry: { start: (cols: number, rows: number) => void };
-	};
+	}>(attach);
 	const sent: Array<Record<string, unknown>> = [];
-	(internals as unknown as { send: (msg: Record<string, unknown>) => void }).send = (msg) => sent.push(msg);
+	(fixtureInternals<{ send: (msg: Record<string, unknown>) => void }>(internals)).send = (msg) => sent.push(msg);
 	internals.jiggleRetry.start(20, 5);
 	out.minimumSizeAvoidsInvalidShrink = sent.length === 1 && sent[0].type === "resize" && sent[0].cols === 20 && sent[0].rows === 5;
 	attach.dispose();
@@ -654,11 +665,11 @@ async function runStaleSocketIdentityScenario(): Promise<boolean> {
 		() => {},
 		{ socketPath, title: "identity" },
 	);
-	const internals = attach as unknown as {
+	const internals = fixtureInternals<{
 		socket: import("node:net").Socket | null;
 		connected: boolean;
 		status: string;
-	};
+	}>(attach);
 	try {
 		const connected = await waitFor(() => internals.connected && internals.socket !== null, 2000);
 		if (!connected) return false;
@@ -682,7 +693,7 @@ async function runStaleSocketIdentityScenario(): Promise<boolean> {
 	} finally {
 		attach.dispose();
 		for (const socket of serverSockets) {
-			try { socket.destroy(); } catch {}
+			try { socket.destroy(); } catch { /* best-effort fixture teardown */ }
 		}
 		await new Promise<void>((resolve) => server.close(() => resolve()));
 		rmSync(root, { recursive: true, force: true });
