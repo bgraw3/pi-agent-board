@@ -15,6 +15,7 @@ import { createTerminalAttachClient } from "../src/core/terminal-attach-client.m
 import { capturePostmortem, formatPostmortem, waitForWithPostmortem } from "../test-support/flake-postmortem.mjs";
 import { DEFAULT_SCROLLBACK_SNAPSHOT_CAP } from "../src/core/terminal-snapshot.mjs";
 import { collectBurstIds, formatBurstDiagnostics } from "../test-support/burst-diagnostics.mjs";
+import { createEchoProbe } from "../test-support/echo-probe.mjs";
 
 // Spec acceptance coverage (issue #91 phase 4):
 //   A5  — snapshot/subscribe 无 gap、无重复（real runner, real socket, real client module）
@@ -320,15 +321,12 @@ test("A5: burst through the snapshot window — frame→flush→end interleaving
 		// broadcast before this connection is accepted, and legacy output has no
 		// replay): probe with an echo instead — the fake-pty echoes every input,
 		// so a probe line ALWAYS produces output on a live host.
-		let probeN = 0;
-		const probeTimer = setInterval(() => {
-			probeN += 1;
-			send(driver, { type: "input", data: `boot-probe-${probeN}\r` });
-		}, 300);
+		const probe = createEchoProbe({ send: (line) => send(driver, { type: "input", data: line }) });
+		probe.start();
 		try {
-			await waitFor(() => driverMessages.find((m) => m.type === "output" && /boot-probe-\d/.test(String(m.data))), 30000, capture);
+			await waitFor(() => driverMessages.find((m) => m.type === "output" && /echo:boot-probe-\d/.test(String(m.data))), 30000, capture);
 		} finally {
-			clearInterval(probeTimer);
+			probe.stop();
 		}
 
 		// Client B: real client module, subscribed mid-burst.
