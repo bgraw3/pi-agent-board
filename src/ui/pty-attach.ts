@@ -13,7 +13,7 @@ import { createJiggleRetryController } from "../core/pty-attach-jiggle-controlle
 import { createTerminalAttachClient } from "../core/terminal-attach-client.mjs";
 import { backgroundRgbFromTerminalColors, buildSettleSchemePatch, colorSchemeForBackgroundRgb, extractOscQuerySequences, resolveProbeApi, toColorSchemeReport } from "../core/terminal-query-sequences.mjs";
 import { REPLY_GUARD_WINDOW_MS, createReplyGuard, isReplyGuardEnabled } from "../core/terminal-reply-guard.mjs";
-import { clampInt, encodeWheelReport, parseMouseInputChunk, resolveAttachMouseAction, resolveAttachWheelRoute, resolvePasteSelectionSource, resolveWheelLines, scrollViewportTop, selectionDragScrollLines, shouldMirrorSelectionToPrimary, shouldOwnOuterMouseMode, wheelScrollLinesUp } from "../core/pty-scroll.mjs";
+import { clampInt, encodeWheelReport, resolveAttachMouseAction, resolveAttachWheelRoute, resolvePasteSelectionSource, resolveWheelLines, scrollViewportTop, selectionDragScrollLines, shouldMirrorSelectionToPrimary, shouldOwnOuterMouseMode, splitAttachInput, wheelScrollLinesUp } from "../core/pty-scroll.mjs";
 
 export type PtyAttachResult = { action: "detached" } | { action: "closed"; exitCode?: number | null };
 
@@ -307,19 +307,50 @@ export class PtyAttachComponent implements Component {
 	}
 
 	handleInput(data: string): void {
-		const guard = this.replyGuard;
-		if (guard) {
-			const decision = guard.feed(data, this.nowFn());
-			if (guard.pendingSince() !== null) this.armReplyGuardTimer();
-			if (decision.action === "forward") {
-				// Color replies only work for the child's parsers as one sequence.
-				this.send({ type: "input", data: decision.data });
-				return;
+		// Issue #189: dispatch per segment instead of all-or-nothing. A read that mixes mouse
+		// reports with other bytes used to fall through to the keyboard branch as a whole: the
+		// gesture was dropped, an in-progress selection cleared, the viewport reset, and the raw
+		// mouse bytes forwarded into the hosted session as typed input.
+		//
+		// Issue #170/#194 composition: the inbound reply guard runs per non-mouse segment, so a
+		// recognized report segment can never absorb keys that arrived in the same read — the
+		// coalescing case #189 exists for (a still-fragmented head keeps the bounded #194
+		// absorption: 64 bytes / 250ms, kill-switchable). The guard's decision wins for complete
+		// protocol replies (dropped) and colour replies (forwarded as one whole sequence);
+		// whatever it passes falls through to the kind-based dispatch below.
+		for (const segment of splitAttachInput(data)) {
+			if (segment.kind === "mouse") {
+				this.handleMouseInputChunk(segment.events);
+			} else if (!this.consumeByReplyGuard(segment.data)) {
+				if (segment.kind === "report") this.send({ type: "input", data: segment.data });
+				else this.handleKeyInput(segment.data);
 			}
-			if (decision.action === "swallow") return;
+			// A detach/close inside a segment must stop the rest of this read.
+			if (this.closed) return;
 		}
-		const mouseInput = parseMouseInputChunk(data);
-		if (mouseInput && this.handleMouseInputChunk(mouseInput)) return;
+	}
+
+	/** Issue #170/#194: feed one non-mouse segment through the inbound reply guard. Returns true
+	 * when the guard took the segment — a complete protocol reply is dropped, a colour reply is
+	 * forwarded as one whole sequence — and false when the caller should handle it. */
+	private consumeByReplyGuard(data: string): boolean {
+		const guard = this.replyGuard;
+		if (!guard) return false;
+		const decision = guard.feed(data, this.nowFn());
+		if (guard.pendingSince() !== null) this.armReplyGuardTimer();
+		if (decision.action === "forward") {
+			// Color replies only work for the child's parsers as one sequence.
+			this.send({ type: "input", data: decision.data });
+			return true;
+		}
+		return decision.action === "swallow";
+	}
+
+	/** Keyboard branch of `handleInput` (issue #189: one segment of the read at a time). Terminal
+	 * *reports* never reach the key branches: a report the reply guard does not own is forwarded
+	 * by `handleInput` without touching the selection or the viewport, because it carries no user
+	 * intent (focus events, query replies). */
+	private handleKeyInput(data: string): void {
 		if (matchesKey(data, Key.pageUp)) {
 			this.clearPendingClick();
 			this.clearSelection();
@@ -706,9 +737,10 @@ export class PtyAttachComponent implements Component {
 		// flips false (never re-armed), so these hooks run at most once per attach.
 		this.attachColorSchemeBridge();
 		// Use only the tracked TUI probe. An extra terminal.write(OSC 11) has
-		// no local query owner, so its reply falls through handleInput into the
-		// child PTY. Settle can precede the child's raw-mode startup, making
-		// the line discipline echo that reply as visible ^[]11;rgb:... text.
+		// no local query owner, so handleInput's report branch forwards its
+		// reply to the child PTY. Settle can precede the child's raw-mode
+		// startup, making the line discipline echo that reply as visible
+		// ^[]11;rgb:... text.
 		this.reportRealTerminalColorScheme();
 	}
 
