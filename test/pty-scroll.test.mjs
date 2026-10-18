@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	encodeWheelReport,
+	historyFloorAfterHydrate,
 	mouseWheelDirection,
 	parseMouseEvent,
 	parseMouseInputChunk,
@@ -12,6 +13,7 @@ import {
 	resolveWheelLines,
 	sameMousePoint,
 	sameScreenCell,
+	scrollableHistoryLines,
 	scrollViewportTop,
 	selectionDragScrollLines,
 	selectionReleaseIsDrag,
@@ -376,4 +378,49 @@ test("parseMouseInputChunk decodes a concatenated X10 gesture in order (issue #1
 	// Seven bytes is not an X10 report: the all-or-nothing chunk parser rejects it
 	// (#189), which is why every literal above is exactly six bytes.
 	assert.equal(parseMouseInputChunk("\x1b[M !\"\x1b[M#20\""), null);
+});
+
+test("historyFloorAfterHydrate disables local history when hydration overflowed", () => {
+	assert.equal(historyFloorAfterHydrate(27, 0), 27);
+	// overflow => local history disabled (the manufactured rows sit above the oldest real rows)
+	assert.equal(historyFloorAfterHydrate(127, 100), 127);
+	// the realistic non-overflow hydrate: the frame fit exactly, so baseY is the whole
+	// runner-vouched scrollback (baseY === scrollbackLines) and every row above the
+	// viewport is real history. A `>=` typo in the comparison would disable it.
+	assert.equal(historyFloorAfterHydrate(10, 10), 0);
+	assert.equal(historyFloorAfterHydrate(5, 10), 0);
+	assert.equal(historyFloorAfterHydrate(0, 0), 0);
+});
+
+test("historyFloorAfterHydrate never returns NaN for unvalidated input", () => {
+	assert.equal(historyFloorAfterHydrate(undefined, 0), 0);
+	assert.equal(historyFloorAfterHydrate(27, undefined), 27);
+	assert.equal(historyFloorAfterHydrate(Number.NaN, Number.NaN), 0);
+	assert.equal(historyFloorAfterHydrate(27, Number.POSITIVE_INFINITY), 27);
+});
+
+test("scrollableHistoryLines reports only the rows above the floor", () => {
+	assert.equal(scrollableHistoryLines(27, 27), 0);
+	assert.equal(scrollableHistoryLines(127, 27), 100);
+	assert.equal(scrollableHistoryLines(0, 0), 0);
+	assert.equal(scrollableHistoryLines(5, 9), 0);
+});
+
+test("scrollViewportTop honours the floor and matches the legacy behaviour at floor 0", () => {
+	// floor === bottom: nothing to scroll back to
+	assert.deepEqual(scrollViewportTop(null, 27, 1, 27), { viewportTop: null, changed: false });
+	assert.deepEqual(scrollViewportTop(27, 27, 1, 27), { viewportTop: null, changed: false });
+	// floor 0 must reproduce the pre-change contract exactly
+	assert.deepEqual(scrollViewportTop(null, 27, 1, 0), { viewportTop: 26, changed: true });
+	assert.deepEqual(scrollViewportTop(27, 27, 1), { viewportTop: 26, changed: true });
+	assert.deepEqual(scrollViewportTop(0, 27, 1, 0), { viewportTop: 0, changed: false });
+	// floor clamps a downward scroll the same way bottom does
+	assert.deepEqual(scrollViewportTop(5, 27, -5, 10), { viewportTop: 15, changed: true });
+});
+
+test("scrollViewportTop snaps a below-floor viewport up to the floor without consuming", () => {
+	// Issue #205: a viewport parked below a floor that later rose (hydrate/resize)
+	// must settle onto the floor instead of scrolling the pseudo history in between.
+	assert.deepEqual(scrollViewportTop(3, 27, 1, 27), { viewportTop: null, changed: false });
+	assert.deepEqual(scrollViewportTop(3, 27, 1, 10), { viewportTop: 10, changed: false });
 });

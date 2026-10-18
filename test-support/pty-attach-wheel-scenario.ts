@@ -18,7 +18,13 @@
 //      disconnected: issue #198 made a *connected* attach forward the wheel to
 //      the child when the local viewport cannot move, and this case pins the
 //      disconnected half of that rule (a forward would be a silent no-op);
-//   3. a wheel report with no delta, and a non-wheel press, both fall through.
+//   3. a wheel report with no delta, and a non-wheel press, both fall through;
+//   4. the AGENT_BOARD_ATTACH_MOUSE / AGENT_BOARD_ENABLE_MOUSE_SCROLL kill
+//      switches disable local scrolling in fullscreen too;
+//   5. Home still scrolls a legacy attach (no hydrate floor) to line 0;
+//   6. hydrating an authoritative frame taller than this terminal leaves no
+//      scrollable history (issue #205: the overflow is hydration residue, so the
+//      floor has to swallow it).
 // Run via `node --experimental-transform-types`.
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -63,9 +69,15 @@ const result = {
 	scrollSwitchOffFallsThrough: false,
 	scrollSwitchOffNoMove: false,
 	restoredAfterKillSwitch: false,
+	legacyHomeScrolls: false,
+	legacyHomeViewportTop: null as number | null,
+	hydratedBaseY: 0,
+	hydratedHistoryFloor: 0,
+	hydratedFloorStartIsBottom: false,
 };
 
 let component: any = null;
+let hydrated: any = null;
 try {
 	component = new PtyAttachComponent(
 		tui as never,
@@ -114,12 +126,42 @@ try {
 	delete process.env.AGENT_BOARD_ENABLE_MOUSE_SCROLL;
 	// Both switches cleared ⇒ local scrolling is back.
 	result.restoredAfterKillSwitch = !!component.handleMouse(wheelEvent(-3));
+
+	// 5. Issue #205: this component never hydrated a snapshot, so its scrollback is
+	// real history and the Home key still jumps the local viewport to line 0.
+	result.legacyHomeScrolls = component.tryScrollToTop();
+	result.legacyHomeViewportTop = component.viewportTop;
+
+	// 6. Issue #205: hydrating an authoritative frame taller than this terminal
+	// scrolls the overflow rows into the local buffer, but those rows are a
+	// by-product of the hydration, not session history the runner ever had. The
+	// floor must swallow them so the first wheel notch is forwarded instead of
+	// spent scrolling them.
+	hydrated = new PtyAttachComponent(
+		tui as never,
+		theme as never,
+		{} as never,
+		() => {},
+		{ socketPath, title: "wheel hydrate" } as never,
+	);
+	const frame = Array.from({ length: 40 }, (_, i) => `frame row ${i}`).join("\r\n");
+	hydrated.pushOutput(frame, { authoritative: true, scrollbackLines: 0 });
+	// The xterm parse is async: an empty trailing write flushes after the frame's
+	// callback, which is where the floor is set.
+	await new Promise<void>((resolve) => hydrated.term.write("", resolve));
+	result.hydratedBaseY = hydrated.term.buffer.active.baseY;
+	result.hydratedHistoryFloor = hydrated.historyFloor;
+	result.hydratedFloorStartIsBottom =
+		hydrated.scrollFloorStart(hydrated.bodyHeight()) === hydrated.bottomViewportTop(hydrated.bodyHeight());
 } catch (err) {
 	result.error = err instanceof Error ? err.message : String(err);
 } finally {
 	delete process.env.AGENT_BOARD_ATTACH_NATIVE_PASTE;
 	try {
 		component?.dispose();
+	} catch {}
+	try {
+		hydrated?.dispose();
 	} catch {}
 	try {
 		rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 30 });
