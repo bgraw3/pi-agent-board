@@ -5,6 +5,32 @@ conventional commits by `scripts/release_helper.mjs`. Entries are
 forward-only: they begin with the first release after this file landed —
 for earlier history, see the git log and the pull-request list.
 
+## [0.12.0] - 2026-10-19
+
+### Features
+
+- **attach**: ctrl+x in-place delete confirm — archive from the attach view (#193)
+
+### Fixes
+
+- **attach**: re-assert the fullscreen mouse mode when the attach view opens (#208) (#208)
+- **attach**: stop spending wheel notches on snapshot-hydration scrollback (#206)
+- **attach**: decode the X10 mouse release code as release (#200) (#200)
+- **attach**: classify a motion-less legacy drag by screen geometry (#202)
+- **attach**: dispatch mixed input reads per segment and pass terminal reports through (issue #189) (#196)
+- **attach**: forward the fullscreen wheel whenever the local viewport cannot move (#199)
+- **attach**: stop terminal reply fragments leaking into the attached child's input (#194)
+- **attach**: forward the fullscreen wheel to alternate-screen children (#190)
+- **attach**: scroll the fullscreen wheel in the attach viewport (#183)
+
+### Changes
+
+- **attach**: gate the alt-wheel scenario on the child's first frame (#204)
+- accept-registration race — echo-probe waits, flake postmortems, load-independent repro (#192) (#192)
+- **attach**: keep the A5 burst inside the snapshot frame window and pin the window contract (#191)
+
+[0.12.0]: https://github.com/zhuxixi/pi-agent-board/compare/v0.11.1...v0.12.0
+
 ## [0.11.1] - 2026-10-13
 
 ### Fixes
