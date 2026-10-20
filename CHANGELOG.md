@@ -5,6 +5,20 @@ conventional commits by `scripts/release_helper.mjs`. Entries are
 forward-only: they begin with the first release after this file landed —
 for earlier history, see the git log and the pull-request list.
 
+## [0.12.1] - 2026-10-20
+
+### Fixes
+
+- **release**: collapse repeated trailing PR refs in CHANGELOG entries (#218)
+- **attach**: keep the Alt modifier on the forwarded wheel report (#216)
+- **attach**: stop the reply guard swallowing kitty/modifyOtherKeys PageDown (#215)
+
+### Changes
+
+- **attach**: tidy the mouse-enable helper placement and comment indent (#209)
+
+[0.12.1]: https://github.com/zhuxixi/pi-agent-board/compare/v0.12.0...v0.12.1
+
 ## [0.12.0] - 2026-10-19
 
 ### Features
