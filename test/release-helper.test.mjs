@@ -71,7 +71,46 @@ test("parseCommitLines parses conventional subjects with scope, bang, and PR", (
 	assert.deepEqual(entries[0], { type: "feat", scope: "core", message: "add launch options picker", pr: 52 });
 	assert.deepEqual(entries[1], { type: "fix", scope: "", message: "breaking fix without pr", pr: null });
 	assert.deepEqual(entries[2], { type: "docs", scope: "", message: "windows ime note", pr: 38 });
-	assert.deepEqual(entries[3], { type: "other", scope: "", message: "some plain subject (#9)", pr: 9 });
+	assert.deepEqual(entries[3], { type: "other", scope: "", message: "some plain subject", pr: 9 });
+});
+
+test("parseCommitLines collapses a subject's repeated trailing PR refs into one (issue #218)", () => {
+	const entries = parseCommitLines([
+		"fix(attach): re-assert the mouse mode (#208) (#208)",
+		"test: accept-registration race (#192) (#192)",
+		"docs: note (#38) (#38) (#38)",
+	]);
+	assert.deepEqual(entries[0], { type: "fix", scope: "attach", message: "re-assert the mouse mode", pr: 208 });
+	assert.deepEqual(entries[1], { type: "test", scope: "", message: "accept-registration race", pr: 192 });
+	assert.deepEqual(entries[2], { type: "docs", scope: "", message: "note", pr: 38 });
+});
+
+test("parseCommitLines keeps a mid-subject ref that is not a trailing PR tail (issue #218)", () => {
+	const entries = parseCommitLines(["fix(attach): dispatch reads through (issue #189) (#196)"]);
+	assert.deepEqual(entries[0], {
+		type: "fix",
+		scope: "attach",
+		message: "dispatch reads through (issue #189)",
+		pr: 196,
+	});
+});
+
+test("parseCommitLines dedupes on message AND pr so distinct PRs survive (issue #218)", () => {
+	const entries = parseCommitLines(["fix: same message (#12)", "fix: same message (#13)"]);
+	assert.equal(entries.length, 2);
+	assert.deepEqual(
+		entries.map((e) => e.pr),
+		[12, 13],
+	);
+});
+
+test("generateChangelog emits exactly one PR ref when the subject already carries it (issue #218)", () => {
+	const entries = parseCommitLines(["fix(attach): re-assert the mouse mode (#208) (#208)", "some plain subject (#9)"]);
+	const section = generateChangelog({ version: "0.12.0", date: "2026-10-19", entries });
+	assert.ok(section.includes("- **attach**: re-assert the mouse mode (#208)"), section);
+	assert.ok(!section.includes("(#208) (#208)"), section);
+	assert.ok(section.includes("- some plain subject (#9)"), section);
+	assert.ok(!section.includes("(#9) (#9)"), section);
 });
 
 test("parseCommitLines skips version squashes, bump subjects, and merges; dedupes", () => {

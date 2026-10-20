@@ -36,6 +36,31 @@ const CONVENTIONAL_RE =
 const VERSION_SQUASH_RE = /^\d+\.\d+\.\d+(?:[-.][\w.]+)?\s*\(#\d+\)$/;
 /** Functional whitelist for verify (CHANGELOG-worthy types). */
 const FUNCTIONAL_TYPES = new Set(["feat", "fix", "refactor", "docs", "perf"]);
+/** A PR ref sitting at the very end of a subject, e.g. the `(#208)` in `... (#208)`. */
+const TRAILING_PR_RE = /\s*\(#(\d+)\)\s*$/;
+
+/**
+ * Strip trailing PR refs from a subject, keeping the rightmost as the PR.
+ *
+ * GitHub merge/squash subjects can carry the number twice (`... (#208) (#208)`),
+ * and the conventional regex above captures only the last one, leaving the
+ * earlier copy inside the message where the renderer appends a ref again
+ * (issue #218). Refs in the middle of a subject (`... (issue #189) (#196)`) are
+ * not tail refs and stay verbatim.
+ * @param {string} subject
+ * @returns {{message: string, pr: number|null}}
+ */
+export function stripTrailingPrRefs(subject) {
+	let text = String(subject ?? "").trim();
+	let pr = null;
+	for (let m = text.match(TRAILING_PR_RE); m; m = text.match(TRAILING_PR_RE)) {
+		// Rightmost ref wins: GitHub appends its own number after any that the
+		// author already wrote, so the first match is the authoritative one.
+		if (pr === null) pr = Number(m[1]);
+		text = text.slice(0, m.index).trimEnd();
+	}
+	return { message: text, pr };
+}
 
 /**
  * Parse commit subject lines into changelog entries.
@@ -51,12 +76,14 @@ export function parseCommitLines(lines) {
 		if (VERSION_SQUASH_RE.test(s)) continue;
 		if (/bump\s+version/i.test(s)) continue;
 		if (s.startsWith("Merge ")) continue;
-		const m = s.match(CONVENTIONAL_RE);
-		const prTail = s.match(/\(#(\d+)\)\s*$/);
+		const { message: normalized, pr: tailPr } = stripTrailingPrRefs(s);
+		const m = normalized.match(CONVENTIONAL_RE);
 		const entry = m
-			? { type: m[1], scope: m[2] || "", message: m[3].trim(), pr: m[4] ? Number(m[4]) : null }
-			: { type: "other", scope: "", message: s, pr: prTail ? Number(prTail[1]) : null };
-		const key = `${entry.type}|${entry.scope}|${entry.message}`;
+			? { type: m[1], scope: m[2] || "", message: m[3].trim(), pr: tailPr ?? (m[4] ? Number(m[4]) : null) }
+			: { type: "other", scope: "", message: normalized, pr: tailPr };
+		// PR-aware key: two commits with the same text merged under different
+		// PRs must both keep their number (issue #218).
+		const key = `${entry.type}|${entry.scope}|${entry.message}|${entry.pr ?? ""}`;
 		if (seen.has(key)) continue;
 		seen.add(key);
 		entries.push(entry);
@@ -83,8 +110,13 @@ export function generateChangelog({ version, date, entries, prevTag = null }) {
 		lines.push(`### ${title}`, "");
 		for (const e of group) {
 			const scope = e.scope ? `**${e.scope}**: ` : "";
-			const pr = e.pr ? ` (#${e.pr})` : "";
-			lines.push(`- ${scope}${e.message}${pr}`);
+			// Render defensively: an entry handed in with the ref already in its
+			// message (parse-time normalization missed, hand-authored fixtures)
+			// must still emit the number exactly once (issue #218).
+			const { message, pr: embeddedPr } = stripTrailingPrRefs(e.message);
+			const prNumber = e.pr ?? embeddedPr;
+			const pr = prNumber ? ` (#${prNumber})` : "";
+			lines.push(`- ${scope}${message}${pr}`);
 		}
 		lines.push("");
 	}
