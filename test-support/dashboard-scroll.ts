@@ -75,6 +75,55 @@ try {
 			}
 		}
 	}
+	// With no Running section, the first waiting section may span several
+	// folders. Its stage and folder headers must be reachable too, not merely
+	// its first selectable session row.
+	dashboard.dispose();
+	const fixtureRows = service.rows();
+	for (const firstState of ["needs_input", "idle", "holding", "completed"]) {
+		const rows = fixtureRows.map((row, i) => ({
+			...row,
+			meta: { ...row.meta, cwd: join(root, `folder-${i % 5}`), repoCwd: join(root, `folder-${i % 5}`) },
+			state: { ...row.state, semanticState: i < 20 ? firstState : "completed" },
+		}));
+		const groupedService = {
+			...service,
+			rows: () => rows,
+			row: (id) => rows.find((row) => row.meta.id === id),
+			prewarmHost: () => ({ ok: false }),
+		};
+		for (const width of [120, 60]) {
+			for (const height of [24, 16]) {
+				tui.terminal.rows = height;
+				dashboard = new DashboardComponent(tui, theme, {}, () => {}, {
+					service: groupedService, root, defaultCwd: root, availableModels: [],
+					currentModel: null, currentThinkingLevel: "off",
+				});
+				// Start at the bottom, then walk up to the first session.
+				dashboard.handleInput("\x1b[A");
+				dashboard.render(width);
+				assert.ok(dashboard.scrollTop > 0, "fixture must overflow the screen");
+				for (let step = 1; step < dashboard.orderedIds.length; step++) {
+					dashboard.handleInput("\x1b[A");
+					dashboard.render(width);
+				}
+				assert.equal(dashboard.selectedId, dashboard.orderedIds[0]);
+				const frame = dashboard.render(width);
+				assert.equal(dashboard.scrollTop, 0, `${firstState}: first session must reveal the true top at ${width}x${height}`);
+				const body = dashboard.renderRows(width);
+				assert.ok(frame.includes(body[0]), "first section header must be visible");
+				assert.ok(frame.includes(body[1]), "first folder header must be visible");
+				assert.ok(!frame.some((line) => /↑ \d+ more/.test(line)), "no hidden lines above the first section");
+				// Wrapping from the last session to the first must reveal headers too.
+				dashboard.handleInput("\x1b[A");
+				dashboard.render(width);
+				dashboard.handleInput("\x1b[B");
+				dashboard.render(width);
+				assert.equal(dashboard.scrollTop, 0, "downward wrap must reveal the true top");
+				dashboard.dispose();
+			}
+		}
+	}
 	console.log(JSON.stringify({ ok: true }));
 } finally {
 	dashboard?.dispose();

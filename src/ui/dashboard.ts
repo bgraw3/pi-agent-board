@@ -1779,6 +1779,9 @@ export class DashboardComponent implements Component {
 		if (selLine < this.scrollTop + margin) this.scrollTop = selLine - margin;
 		if (selLine >= this.scrollTop + capacity - margin) this.scrollTop = selLine - capacity + margin + 1;
 		this.scrollTop = Math.max(0, Math.min(this.scrollTop, body.length - capacity));
+		// The first session can follow both a stage and a folder header. Those
+		// lines aren't selectable, so reveal them when the first session fits.
+		if (this.selectedId === this.orderedIds[0] && selLine < capacity) this.scrollTop = 0;
 		const slice = body.slice(this.scrollTop, this.scrollTop + capacity);
 		const more = body.length - this.scrollTop - capacity;
 		if (this.scrollTop > 0 && selLine !== this.scrollTop) slice[0] = this.theme.fg("dim", `  ↑ ${this.scrollTop + 1} more`);
