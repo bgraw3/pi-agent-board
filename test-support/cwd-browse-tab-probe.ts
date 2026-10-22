@@ -29,9 +29,9 @@ const tui = {
 	terminal: { rows: 24, cols: 80, columns: 80, write: () => {} },
 	requestRender: () => {},
 };
-const theme = { fg: (_c, t) => t, bold: (t) => t };
+const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 
-const dash = new DashboardComponent(tui, theme, {}, () => {}, {
+const dash: any = new DashboardComponent(tui as never, theme as never, {} as never, () => {}, {
 	service,
 	root,
 	defaultCwd: root,
@@ -46,7 +46,7 @@ dash.input = "go";
 dash.openLaunchDialog();
 dash.openLaunchPicker("cwd", join(root, "wo"));
 
-const out = { root, work };
+const out: Record<string, unknown> = { root, work };
 out.mode0 = dash.launch.cwdPickerMode;
 out.sugg0 = dash.launch.cwdSuggestions;
 

@@ -23,7 +23,7 @@ const service = {
 };
 const tui = { terminal: { rows: 24, cols: 80, columns: 80, write: () => {} }, requestRender: () => {} };
 const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
-const dash = new DashboardComponent(tui as never, theme as never, {} as never, () => {}, {
+const dash: any = new DashboardComponent(tui as never, theme as never, {} as never, () => {}, {
 	service: service as never, root: "/", defaultCwd: "/", availableModels: [], currentModel: null, currentThinkingLevel: "off",
 });
 dash.selectedId = "v1";
