@@ -368,14 +368,22 @@ export function filterRows(rows, query) {
 	if (states.length === 0 && terms.length === 0 && prNumber === null && !reviewReady && !diagStalled && !evidenceError && !queued && !steering) return rows;
 	return rows.filter((row) => {
 		if (states.length > 0 && !states.includes(rowState(row))) return false;
-		if (prNumber !== null && !row.codeRefs?.allRefs?.some((ref) => ref.kind === "pr" && ref.number === prNumber)) return false;
+		const prRefs = [row.codeRefs?.pr, ...(row.codeRefs?.allRefs ?? [])];
+		if (prNumber !== null && !prRefs.some((ref) => ref?.kind === "pr" && ref.number === prNumber)) return false;
 		if (reviewReady && !row.state?.review?.ready) return false;
 		if (diagStalled && !row.state?.diagnostics?.stalled) return false;
 		if (evidenceError && (row.state?.review?.errorCount ?? 0) <= 0) return false;
 		if (queued && (row.state?.followUps?.queuedCount ?? 0) <= 0) return false;
 		if (steering && normalizeStateToken(row.state?.steering?.status ?? "none") !== steering) return false;
 		if (terms.length === 0) return true;
-		const hay = [row.meta.name, row.state?.summary ?? "", row.meta.repoCwd, row.meta.cwd]
+		// Search the bounded, persisted PR refs already displayed by the board.
+		// A partial number ("2", "22", "227") narrows results as it is typed;
+		// issue refs stay distinct and the session transcript is not scanned.
+		const prText = prRefs
+			.filter((ref) => ref?.kind === "pr" && Number.isSafeInteger(ref.number))
+			.map((ref) => `PR #${ref.number} !${ref.number}`)
+			.join(" ");
+		const hay = [row.meta.name, row.state?.summary ?? "", row.meta.repoCwd, row.meta.cwd, prText]
 			.join(" ")
 			.toLowerCase();
 		return terms.every((t) => hay.includes(t));
