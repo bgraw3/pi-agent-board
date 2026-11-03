@@ -244,6 +244,7 @@ Press `/` to enter filter mode. Filter tokens are case-insensitive and can be co
 ```text
 s:running
 s:hold
+pr:227
 review:ready
 diag:stalled
 evidence:error
@@ -252,6 +253,7 @@ steer:awaiting-approval
 ```
 
 - `s:<state>` matches a state prefix, including display-label aliases such as `needs-answer`.
+- `pr:<number>` matches an exact extracted PR/MR reference (including secondary refs), not an issue with the same number. `pr:#227` and `pr:!227` also work; this uses the board's persisted evidence, not a live GitHub search.
 - `review:ready` finds sessions with review-ready evidence.
 - `evidence:error` finds sessions whose evidence contains errors.
 - `queued:true` (also `yes` or `1`) finds sessions with queued follow-ups.

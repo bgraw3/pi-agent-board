@@ -298,9 +298,10 @@ function normalizeFolderKey(path) {
 
 /**
  * Parse a filter query into a state filter + free-text terms.
- * Supports `s:<state>` (state prefix) and bare words (AND substring match).
+ * Supports `s:<state>` (state prefix), `pr:<number>` (exact PR reference),
+ * and bare words (AND substring match).
  * @param {string} query
- * @returns {{ states: SemanticState[], terms: string[], reviewReady: boolean, diagStalled: boolean, evidenceError: boolean, queued: boolean, steering: string|null }}
+ * @returns {{ states: SemanticState[], terms: string[], prNumber: number|null, reviewReady: boolean, diagStalled: boolean, evidenceError: boolean, queued: boolean, steering: string|null }}
  */
 export function parseFilter(query) {
 	/** @type {Set<SemanticState>} */
@@ -308,6 +309,7 @@ export function parseFilter(query) {
 	/** @type {string[]} */
 	const terms = [];
 	let reviewReady = false;
+	let prNumber = null;
 	let diagStalled = false;
 	let evidenceError = false;
 	let queued = false;
@@ -320,6 +322,8 @@ export function parseFilter(query) {
 				const aliases = [s, GROUP_LABELS[s]];
 				if (aliases.some((alias) => matchesStateToken(alias, want))) states.add(s);
 			}
+		} else if (/^pr:(?:#|!)?[1-9]\d*$/i.test(tok) && Number.isSafeInteger(Number(tok.replace(/^pr:(?:#|!)?/i, "")))) {
+			prNumber = Number(tok.replace(/^pr:(?:#|!)?/i, ""));
 		} else if (/^review:ready$/i.test(tok)) {
 			reviewReady = true;
 		} else if (/^diag:stalled$/i.test(tok)) {
@@ -334,7 +338,7 @@ export function parseFilter(query) {
 			terms.push(tok.toLowerCase());
 		}
 	}
-	return { states: [...states], terms, reviewReady, diagStalled, evidenceError, queued, steering };
+	return { states: [...states], terms, prNumber, reviewReady, diagStalled, evidenceError, queued, steering };
 }
 
 /** @param {string} value */
@@ -350,7 +354,7 @@ function matchesStateToken(alias, want) {
 
 /** @param {string} query @returns {boolean} whether the text is a filter expression. */
 export function isFilterQuery(query) {
-	return /(^|\s)(s:|review:|diag:|evidence:|queued:|steer:)/i.test(query || "");
+	return /(^|\s)(s:|pr:|review:|diag:|evidence:|queued:|steer:)/i.test(query || "");
 }
 
 /**
@@ -360,10 +364,11 @@ export function isFilterQuery(query) {
  * @returns {Row[]}
  */
 export function filterRows(rows, query) {
-	const { states, terms, reviewReady, diagStalled, evidenceError, queued, steering } = parseFilter(query);
-	if (states.length === 0 && terms.length === 0 && !reviewReady && !diagStalled && !evidenceError && !queued && !steering) return rows;
+	const { states, terms, prNumber, reviewReady, diagStalled, evidenceError, queued, steering } = parseFilter(query);
+	if (states.length === 0 && terms.length === 0 && prNumber === null && !reviewReady && !diagStalled && !evidenceError && !queued && !steering) return rows;
 	return rows.filter((row) => {
 		if (states.length > 0 && !states.includes(rowState(row))) return false;
+		if (prNumber !== null && !row.codeRefs?.allRefs?.some((ref) => ref.kind === "pr" && ref.number === prNumber)) return false;
 		if (reviewReady && !row.state?.review?.ready) return false;
 		if (diagStalled && !row.state?.diagnostics?.stalled) return false;
 		if (evidenceError && (row.state?.review?.errorCount ?? 0) <= 0) return false;

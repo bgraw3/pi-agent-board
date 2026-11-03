@@ -196,6 +196,20 @@ test("filterRows by free text over name/summary/cwd (AND)", () => {
 	assert.deepEqual(filterRows(rows, "auth styling").map((r) => r.meta.id), []);
 });
 
+test("pr:number finds exact persisted PR refs, not issues or text mentions", () => {
+	const rows = [
+		row("pr", "working", { name: "review task", codeRefs: { pr: { kind: "pr", number: 22 }, allRefs: [{ kind: "pr", number: 22 }, { kind: "pr", number: 227 }] } }),
+		row("issue", "working", { name: "PR 227", codeRefs: { issue: { kind: "issue", number: 227 }, allRefs: [{ kind: "issue", number: 227 }] } }),
+		row("other", "completed", { codeRefs: { pr: { kind: "pr", number: 2270 }, allRefs: [{ kind: "pr", number: 2270 }] } }),
+	];
+	assert.deepEqual(filterRows(rows, "pr:227").map((r) => r.meta.id), ["pr"]);
+	assert.deepEqual(filterRows(rows, "PR:#227 s:work review").map((r) => r.meta.id), ["pr"]);
+	assert.deepEqual(filterRows(rows, "pr:!227").map((r) => r.meta.id), ["pr"]);
+	assert.deepEqual(filterRows(rows, "pr:228"), []);
+	assert.equal(parseFilter("pr:227").prNumber, 227);
+	assert.deepEqual(parseFilter("pr:0").terms, ["pr:0"], "invalid PR tokens are not silently ignored");
+});
+
 test("filterRows empty query returns all", () => {
 	const rows = [row("a", "working"), row("b", "completed")];
 	assert.equal(filterRows(rows, "").length, 2);
