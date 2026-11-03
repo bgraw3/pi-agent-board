@@ -39,6 +39,21 @@ test("attach positions Kitty images in body rows, never directly at the host cur
 	assert.ok(attach.render(40).every((line: string) => !line.includes("\x1b_G")));
 });
 
+test("committed view retains Kitty images through parser replacement and rebuilds them from the new frame", async (t) => {
+	const { attach, feed } = fixture(t);
+	attach.attachMode = "protocol";
+	attach.frameWitnessAvailable = true;
+	attach.currentWireGeneration = "local";
+	await feed(`\x1b[?2026h\x1b[3;4H${image}\x1b[?2026l`);
+	assert.ok(attach.project(10).lines.some((line: string) => line.includes("i=42")));
+	assert.equal(attach.replaceParser(), true);
+	assert.ok(attach.project(10).lines.some((line: string) => line.includes("i=42")), "recovery view keeps its image after old parser disposal");
+	await feed(`\x1b[?2026h\x1b[4;4H${image.replace("i=42", "i=43")}\x1b[?2026l`);
+	const lines = attach.project(10).lines.join("");
+	assert.ok(lines.includes("i=43"), "new parser accepts the resnapshot image");
+	assert.ok(!lines.includes("i=42"), "old placement is not reused");
+});
+
 test("Pi's main renderer deletes placements when images scroll completely out", async (t) => {
 	const { attach, feed } = fixture(t);
 	await feed(`\x1b[3;4H${image}\x1b[10;1Hfooter`);

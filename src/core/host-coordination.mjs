@@ -41,16 +41,84 @@ export function isStartingWithinGrace(host, now, graceMs) {
  * Five states — `not_started` (never spawned) must never be conflated with
  * `dead`, and a missing stable token must never be guessed as alive-owned:
  * it degrades to `unknown` so recovery can only refuse, never misfire.
+ *
+ * `not_started` requires BOTH the identity and `spawnedAt` to be absent: a
+ * recorded identity is proof the spawn happened, so such a record is judged by
+ * the observation. Calling it `not_started` (a releasable state) on a
+ * spawned-but-incomplete record could release a still-live host and let a new
+ * host double-write the session file.
  * @param {{pid:number,startToken:string|null}|null|undefined} identity The recorded identity.
  * @param {{alive:boolean,startToken:string|null}|null|undefined} observed The observation.
  * @param {number|null|undefined} spawnedAt Non-null only after spawn was confirmed.
  * @returns {"not_started"|"dead"|"owned"|"foreign"|"unknown"}
  */
 export function processIdentityState(identity, observed, spawnedAt) {
-	if (spawnedAt == null) return "not_started";
+	if (spawnedAt == null && identity == null) return "not_started";
 	if (observed?.alive === false) return "dead";
 	if (identity?.startToken == null || observed?.startToken == null) return "unknown";
 	return identity.startToken === observed.startToken ? "owned" : "foreign";
+}
+
+/** Characters that may abut a path fragment in a command line without being part of it. */
+const COMMAND_LINE_BOUNDARIES = /[\s"']/;
+
+/** Windows path semantics: separators and case are not significant. */
+function normalizeCommandLine(text) {
+	return text.replace(/\\/g, "/").toLowerCase();
+}
+
+function isCommandLineBoundary(text, index, length) {
+	const before = index === 0 ? null : text[index - 1];
+	const after = index + length >= text.length ? null : text[index + length];
+	return (before == null || COMMAND_LINE_BOUNDARIES.test(before)) && (after == null || COMMAND_LINE_BOUNDARIES.test(after));
+}
+
+/**
+ * Whether a process command line mentions `fragment` as a whole path, not as a
+ * prefix of a longer one (`view_abc` must not match `view_abcd`, nor
+ * `session.jsonl` match `session-2.jsonl`). Comparison is slash- and
+ * case-insensitive because Windows reports `C:\x\y` inside quotes while the
+ * recorded fragment is a plain path (issue #217). Empty/missing input is never
+ * a match: a blank fragment would otherwise corroborate any process.
+ * @param {string|null|undefined} commandLine
+ * @param {string|null|undefined} fragment
+ * @returns {boolean}
+ */
+export function commandLineMentions(commandLine, fragment) {
+	if (!commandLine || !fragment) return false;
+	const haystack = normalizeCommandLine(commandLine);
+	const needle = normalizeCommandLine(fragment);
+	let index = haystack.indexOf(needle);
+	while (index !== -1) {
+		if (isCommandLineBoundary(haystack, index, needle.length)) return true;
+		index = haystack.indexOf(needle, index + 1);
+	}
+	return false;
+}
+
+/**
+ * Refine a host-role observation that the token path could only call `unknown`
+ * (platforms without a start token) using deterministic probe evidence
+ * (issue #217). The command line is authoritative because every host role we
+ * spawn carries its own unique path argument; process creation time only
+ * corroborates when the command line is unreadable, and the tolerance absorbs
+ * spawn→record skew. A missing probe stays `unknown` — the #70 contract: an
+ * unverifiable process is never guessed as foreign.
+ * @param {{
+ *   spawnedAt: number|null,
+ *   probe: {creationTimeMs: number|null, commandLine: string|null}|null,
+ *   expectedCommandFragment: string|null,
+ *   toleranceMs: number,
+ * }} input
+ * @returns {"owned"|"foreign"|"unknown"}
+ */
+export function classifyUnverifiableProcess({ spawnedAt, probe, expectedCommandFragment, toleranceMs }) {
+	if (!probe) return "unknown";
+	if (probe.commandLine && expectedCommandFragment) {
+		return commandLineMentions(probe.commandLine, expectedCommandFragment) ? "owned" : "foreign";
+	}
+	if (spawnedAt == null || probe.creationTimeMs == null) return "unknown";
+	return Math.abs(probe.creationTimeMs - spawnedAt) <= toleranceMs ? "owned" : "foreign";
 }
 
 /** Role observations that mean "no live process can belong to the old instance". */
@@ -91,6 +159,54 @@ export function canReplaceHost({ host, runnerObservation, childObservation, laun
  */
 export function ownsEndpoint(bound, current) {
 	return Boolean(bound && current && bound.dev === current.dev && bound.ino === current.ino);
+}
+
+/**
+ * Whether this instance may unlink the endpoint path now.
+ * Restores the #70 cleanup contract (docs/superpowers/specs/
+ * 2026-09-05-pty-host-stacking-sock-race-design.md:418): the path must still be
+ * the inode this instance bound AND this instance must still own the lease.
+ * `compromised` lets the supervised tick veto its own cleanup after detecting
+ * that the endpoint is gone or replaced (issue #255).
+ * @param {{
+ *   stillOwner: boolean,
+ *   compromised: boolean,
+ *   bound: {dev:number,ino:number}|null|undefined,
+ *   current: {dev:number,ino:number}|null|undefined,
+ * }} input
+ * @returns {boolean}
+ */
+export function shouldUnlinkEndpoint({ stillOwner, compromised, bound, current }) {
+	if (!stillOwner || compromised) return false;
+	return ownsEndpoint(bound, current);
+}
+
+/**
+ * Map one supervised stat attempt to the endpoint observation discriminator.
+ * A transient stat failure (EACCES/EBUSY/...) must never be read as "replaced":
+ * only ENOENT means the endpoint is actually gone (issue #255, mirrors the
+ * rootVanishedOrReplaced rule of issue #241).
+ * @param {{dev:number,ino:number}|null} stat The successful stat snapshot, or null.
+ * @param {string|null} errorCode The stat error code, or null on success.
+ * @returns {{kind:"ok",dev:number,ino:number}|{kind:"missing"}|{kind:"unknown"}}
+ */
+export function socketIdentityObservation(stat, errorCode) {
+	if (stat) return { kind: "ok", dev: stat.dev, ino: stat.ino };
+	return errorCode === "ENOENT" ? { kind: "missing" } : { kind: "unknown" };
+}
+
+/**
+ * Classify the supervised endpoint against the identity bound at boot.
+ * `unknown` never steps a holder down: without a bound identity (win32, or a
+ * failed bind-time stat) the supervisor degrades to a no-op.
+ * @param {{dev:number,ino:number}|null|undefined} bound
+ * @param {{kind:"ok",dev:number,ino:number}|{kind:"missing"}|{kind:"unknown"}|null|undefined} observed
+ * @returns {"ok"|"missing"|"replaced"|"unknown"}
+ */
+export function classifyEndpointHealth(bound, observed) {
+	if (!bound || !observed || observed.kind === "unknown") return "unknown";
+	if (observed.kind === "missing") return "missing";
+	return ownsEndpoint(bound, observed) ? "ok" : "replaced";
 }
 
 /**

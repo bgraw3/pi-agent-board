@@ -358,9 +358,9 @@ export class DashboardComponent implements Component {
 
 	private handleListKey(data: string): void {
 		if (!matchesKey(data, Key.ctrl("x"))) this.deleteArm = null;
-		if (matchesKey(data, Key.up)) return void this.moveSelection(-1);
-		if (matchesKey(data, Key.down)) return void this.moveSelection(1);
-		if (matchesKey(data, Key.right) || data === ">") return this.attachSelected();
+		if (matchesKey(data, Key.up) || data === "k") return void this.moveSelection(-1);
+		if (matchesKey(data, Key.down) || data === "j") return void this.moveSelection(1);
+		if (matchesKey(data, Key.right) || data === ">" || data === "l") return this.attachSelected();
 		if (data === "v") return this.openSessionView();
 		if (data === "e") return this.openEvidenceView();
 		if (matchesKey(data, Key.enter)) {
@@ -378,10 +378,8 @@ export class DashboardComponent implements Component {
 		if (matchesKey(data, Key.ctrl("t"))) return this.togglePin();
 		if (matchesKey(data, Key.ctrl("s"))) return this.stopSelected();
 		if (data === "d") return this.confirmDone();
-		if (data === "d") return this.confirmDone();
 		if (data === "x") return this.confirmDelete();
 		if (data === "h") return this.toggleHold();
-		if (matchesKey(data, Key.ctrl("x"))) return this.handleDeleteKey();
 		if (matchesKey(data, Key.ctrl("x"))) return this.handleDeleteKey();
 		if (data === "X") return this.confirmDeleteState();
 		if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
@@ -398,8 +396,8 @@ export class DashboardComponent implements Component {
 	}
 
 	private handleSelectKey(data: string): void {
-		if (matchesKey(data, Key.up)) return void this.moveSelection(-1);
-		if (matchesKey(data, Key.down)) return void this.moveSelection(1);
+		if (matchesKey(data, Key.up) || data === "k") return void this.moveSelection(-1);
+		if (matchesKey(data, Key.down) || data === "j") return void this.moveSelection(1);
 		if (matchesKey(data, Key.space)) {
 			this.toggleSelectedCurrent();
 			return;
@@ -426,13 +424,13 @@ export class DashboardComponent implements Component {
 
 	private handlePeekKey(data: string): void {
 		if (matchesKey(data, Key.escape)) return void (this.mode = "list");
-		if (matchesKey(data, Key.right) || data === ">") return this.attachPeek();
+		if (matchesKey(data, Key.right) || data === ">" || data === "l") return this.attachPeek();
 		if (data === "v") return this.openSessionView();
-		if (matchesKey(data, Key.up)) {
+		if (matchesKey(data, Key.up) || data === "k") {
 			this.peekStep(-1);
 			return;
 		}
-		if (matchesKey(data, Key.down)) {
+		if (matchesKey(data, Key.down) || data === "j") {
 			this.peekStep(1);
 			return;
 		}
@@ -506,7 +504,7 @@ export class DashboardComponent implements Component {
 		}
 		if (data === "r") return this.startReply();
 		if (data === "v") return this.openSessionView();
-		if (data === "a" || matchesKey(data, Key.enter) || matchesKey(data, Key.right)) return this.attachSelected();
+		if (data === "a" || matchesKey(data, Key.enter) || matchesKey(data, Key.right) || data === "l") return this.attachSelected();
 		if (data === "x") return this.confirmClearDiagnostics();
 	}
 
@@ -1350,16 +1348,19 @@ export class DashboardComponent implements Component {
 			return this.hintLine("SELECT", "accent", [
 				`${this.selectionCount()} selected`,
 				...(unread > 0 ? [`•${unread} unread`] : []),
+				"↑↓/j/k move",
 				"space toggle",
 				"a all visible",
 				"u clear",
-				"d move done",
-				"ctrl+x delete done",
-				"esc cancel",
+				"d done",
+				"ctrl+x delete",
+				"m/esc cancel",
+				"? help",
+				"! pty",
 			]);
 		}
 		const primary = this.input.trim() ? "enter launch" : live ? "enter attach live" : "enter resume";
-		const hints = ["i insert", primary, "→ attach", "m multi-select", ...(unread > 0 ? [`•${unread} unread`] : []), "d done", "h hold", "space peek", "v transcript", "e evidence", "ctrl+n new session", "ctrl+r rename", "x delete (y/N)", "ctrl+x x2 quick", "X delete state", "/ filter", "! pty", "? help"];
+		const hints = ["i insert", primary, "→/l attach", "m multi-select", ...(unread > 0 ? [`•${unread} unread`] : []), "d done", "h hold", "space peek", "v transcript", "e evidence", "ctrl+n new session", "ctrl+r rename", "x delete (y/N)", "ctrl+x x2 quick", "X delete state", "/ filter", "! pty", "? help"];
 		if (this.input.trim()) hints.splice(1, 0, "esc clear");
 		return this.hintLine("NORMAL", "muted", hints);
 	}
@@ -1478,7 +1479,12 @@ export class DashboardComponent implements Component {
 		let line = `${marker} ${t.fg(selected ? "text" : "muted", selected ? t.bold(nameText) : nameText)}${folder} ${t.fg(selected ? "text" : "muted", summary)}`;
 		line = padTo(line, contentWidth - visibleWidth(ageRaw));
 		line += t.fg("dim", ageRaw);
-		return clip(`${" ".repeat(indent)}${clip(line, contentWidth)}`, width);
+		// Issue #231: paint `indent + body` so the background opens at column 0 and
+		// covers the trailing pad and the age column. `bg` closes inside the string,
+		// so a clipped row cannot leak into the next line.
+		const body = clip(line, contentWidth);
+		const painted = applyRowHighlight(t, selected, `${" ".repeat(indent)}${body}`);
+		return clip(painted, width);
 	}
 
 	private renderPeek(width: number): string[] {
@@ -1536,7 +1542,7 @@ export class DashboardComponent implements Component {
 			const notice = this.currentInputNotice();
 			if (notice) out.push(clip(t.fg(notice.color, `ⓘ ${notice.text}`), width));
 		} else {
-			out.push(clip(t.fg("dim", "↑↓ prev/next · →/> attach · d done · v transcript · e evidence · r reply · esc back"), width));
+			out.push(clip(t.fg("dim", "↑↓/j/k prev/next · →/l attach · d done · v transcript · e evidence · r reply · esc back"), width));
 		}
 		return out;
 	}
@@ -1558,7 +1564,7 @@ export class DashboardComponent implements Component {
 		const capacity = Math.max(3, (this.tui.terminal?.rows ?? 24) - 5);
 		out.push(...panel.slice(this.evidenceScrollTop, this.evidenceScrollTop + capacity).map((line: string) => clip(line, width)));
 		out.push(t.fg("dim", "─".repeat(width)));
-		out.push(clip(t.fg("dim", "←/< back · ↑↓ scroll · pgup/pgdn page · enter attach · r reply · v transcript · x clear diagnostics"), width));
+		out.push(clip(t.fg("dim", "←/< back · ↑↓/j/k scroll · pgup/pgdn page · enter attach · r reply · v transcript · x clear diagnostics"), width));
 		return out;
 	}
 
@@ -1593,7 +1599,7 @@ export class DashboardComponent implements Component {
 		const capacity = Math.max(3, (this.tui.terminal?.rows ?? 24) - out.length - 3);
 		out.push(...this.windowSession(body, capacity));
 		out.push(t.fg("dim", "─".repeat(width)));
-		out.push(clip(t.fg("dim", "←/< back · ↑↓ scroll · pgup/pgdn page · enter attach · d done · r reply · space peek"), width));
+		out.push(clip(t.fg("dim", "←/< back · ↑↓/j/k scroll · pgup/pgdn page · enter attach · d done · r reply · space peek"), width));
 		return out;
 	}
 
@@ -1701,14 +1707,15 @@ export class DashboardComponent implements Component {
 			["enter", "Normal/insert with draft: open start-session dialog; empty: attach/resume"],
 			["shift+enter", "Insert a newline while in insert/reply"],
 			["esc", "Insert → normal; Normal with draft clears; empty quits standalone dashboard"],
-			["↑/↓", "Normal: move selection; Insert: move cursor"],
+			["↑/↓ or j/k", "Normal: move selection; Insert: move cursor"],
 			["ctrl/alt+←/→", "Jump by word in insert mode"],
-			["→ or >", "Attach to the selected real Pi session"],
+			["→ / > / l", "Attach to the selected real Pi session"],
 			["d", "Confirm and mark selected inactive session done"],
 			["h", "Hold / unhold the selected inactive session (on-hold state)"],
 			["space", "Peek when input is empty; in multi-select: toggle current row"],
 			["e", "Open evidence / diagnostics panel for selected session"],
 			["/", "Filter in normal mode; use i then / for slash commands"],
+			["?", "Open the key help overlay (list and multi-select)"],
 			["!", "Open node-pty diagnostics and fix steps"],
 			["ctrl+n", "Open the new-session launch dialog (prompt pre-filled)"],
 			["ctrl+r/t/s", "Rename · pin · stop selected"],
@@ -1716,10 +1723,10 @@ export class DashboardComponent implements Component {
 			["ctrl+x x2", "Delete selected session (quick double-press, no confirm)"],
 			["X", "Delete all inactive sessions in selected state"],
 			["v", "Open read-only transcript view"],
-			["In select", "a select all visible · u clear · d move done · ctrl+x delete done · esc cancel"],
-			["In peek", "→ attach · v transcript · e evidence · r reply · ↑↓ adjacent"],
-			["In session", "← back · ↑↓ scroll · e evidence · enter attach · r reply"],
-			["In evidence", "← back · ↑↓ scroll · r reply · v transcript · x clear diagnostics"],
+			["In select", "↑↓/j/k move · space toggle · a all · u clear · d done · ctrl+x delete · m/esc cancel"],
+			["In peek", "→/l attach · v transcript · e evidence · r reply · ↑↓/j/k adjacent"],
+			["In session", "← back · ↑↓/j/k scroll · e evidence · enter attach · r reply"],
+			["In evidence", "← back · ↑↓/j/k scroll · →/l attach · r reply · v transcript · x clear diag"],
 		];
 		const dialog = [t.fg("accent", t.bold("Hotkeys / keybindings")), ""];
 		for (const [k, v] of rows) dialog.push(`  ${t.fg("accent", k.padEnd(14))} ${t.fg("muted", v)}`);
@@ -1777,13 +1784,19 @@ export class DashboardComponent implements Component {
 			const idx = body.findIndex((l) => l.includes("›"));
 			selLine = idx >= 0 ? idx : 0;
 		}
-		if (selLine < this.scrollTop) this.scrollTop = selLine;
-		if (selLine >= this.scrollTop + capacity - 1) this.scrollTop = selLine - capacity + 2;
+		// The boundary lines can become scroll markers, so keep selection inside
+		// them. On tiny viewports, prioritize the selected row over markers.
+		const margin = capacity >= 3 ? 1 : 0;
+		if (selLine < this.scrollTop + margin) this.scrollTop = selLine - margin;
+		if (selLine >= this.scrollTop + capacity - margin) this.scrollTop = selLine - capacity + margin + 1;
 		this.scrollTop = Math.max(0, Math.min(this.scrollTop, body.length - capacity));
+		// The first session can follow both a stage and a folder header. Those
+		// lines aren't selectable, so reveal them when the first session fits.
+		if (this.selectedId === this.orderedIds[0] && selLine < capacity) this.scrollTop = 0;
 		const slice = body.slice(this.scrollTop, this.scrollTop + capacity);
 		const more = body.length - this.scrollTop - capacity;
-		if (this.scrollTop > 0) slice[0] = this.theme.fg("dim", `  ↑ ${this.scrollTop} more`);
-		if (more > 0) slice[slice.length - 1] = this.theme.fg("dim", `  ↓ ${more} more`);
+		if (this.scrollTop > 0 && selLine !== this.scrollTop) slice[0] = this.theme.fg("dim", `  ↑ ${this.scrollTop + 1} more`);
+		if (more > 0 && selLine !== this.scrollTop + capacity - 1) slice[slice.length - 1] = this.theme.fg("dim", `  ↓ ${more + 1} more`);
 		return { lines: slice };
 	}
 
@@ -1979,6 +1992,19 @@ const STAGE_RGB = {
 function stageFg(state: keyof typeof GROUP_LABELS, text: string): string {
 	const [r, g, b] = STAGE_RGB[state];
 	return ansiFg(r, g, b, text);
+}
+
+/**
+ * Issue #231: the selected row's full-line background. Pure (the theme is
+ * injected) so the wrap/close contract is unit-testable, and an unselected row
+ * is returned byte-identical.
+ */
+export function applyRowHighlight(
+	theme: Pick<ThemeLike, "bg">,
+	selected: boolean,
+	text: string,
+): string {
+	return selected ? theme.bg("selectedBg", text) : text;
 }
 
 function renderPiIconLine(theme: ThemeLike, line: string): string {

@@ -5,6 +5,42 @@ conventional commits by `scripts/release_helper.mjs`. Entries are
 forward-only: they begin with the first release after this file landed —
 for earlier history, see the git log and the pull-request list.
 
+## [0.13.1] - 2026-10-28
+
+### Fixes
+
+- **attach**: clear the fullscreen selection highlight after copy-on-release (issue #172) (#251)
+- **coordinator**: self-supervise the endpoint and restore the #70 cleanup gate (issue #255) (#256)
+
+### Changes
+
+- **ui**: align SELECT hints, help overlay and ! wording with the handler (issue #252) (#253)
+- sync key hints with the implemented bindings — peek footer, README ! rows, multi-select table (issue #245) (#249)
+
+[0.13.1]: https://github.com/zhuxixi/pi-agent-board/compare/v0.13.0...v0.13.1
+
+## [0.13.0] - 2026-10-26
+
+### Features
+
+- **ui**: vim-style j/k/l board keys — j/k navigate, l attaches (issue #229) (#237)
+- **ui**: paint the selected board row with selectedBg (issue #231) (#233)
+
+### Fixes
+
+- **coordinator**: verify lease identity before signalling (issue #239) (#247)
+- **dashboard**: keep selected rows visible beside scroll markers (#226)
+- **attach**: render cells that only carry a background (#235)
+- **coordinator**: root-vanished self-exit and suite leak gate (issue #241) (#244)
+- **host**: unify process identity tokens and produce them on win32 (issue #238) (#243)
+- **host**: keep warm hosts alive while a background workflow run is active (issue #230) (#242)
+- **host**: corroborate unverified process identity to unstick pid-reuse recovery (issue #217) (#240)
+- **lease**: reclaim stale coordinator leases by heartbeat instead of pid liveness (issue #224) (#236)
+- keep foreground rows monotonic across out-of-order state writes (#228)
+- recognize ask_user_question and questionnaire-shaped tools as pending questions (#223)
+
+[0.13.0]: https://github.com/zhuxixi/pi-agent-board/compare/v0.12.1...v0.13.0
+
 ## [0.12.1] - 2026-10-20
 
 ### Fixes

@@ -117,7 +117,7 @@ Session actions are deliberately confirmation-aware:
 - `h` toggles the on-hold state (manual verdict — automated writers are fenced).
 - Press `x`, then `y` to confirm deleting the selected row. `Ctrl+X` twice quickly still deletes without confirmation. Archiving removes the row from the board but preserves its underlying Pi session file.
 - `X` archives inactive rows in the selected state; live work is skipped.
-- `m` enters multi-select mode. Use `Space` to toggle rows, `a` to select all visible rows, `u` to clear the selection, `d` to mark inactive rows Done, or `Ctrl+X` to delete selected Done rows.
+- `m` enters multi-select mode; see [Multi-select](#multi-select) for its keys.
 
 ## Views and Actions
 
@@ -127,10 +127,10 @@ Shortcuts are scoped to the view where they are available:
 
 | Key | Action |
 | --- | --- |
-| `Up` / `Down` | Move the selection. |
+| `Up` / `Down` / `j` / `k` | Move the selection. |
 | `i` | Enter INSERT mode for a new task. |
 | `Enter` | Open Start session for a draft, or attach/resume when the input is empty. |
-| `Right` / `>` | Attach to the selected session. |
+| `Right` / `>` / `l` | Attach to the selected session. |
 | `Space` | Open Peek. |
 | `v` | Open the read-only transcript. |
 | `e` | Open Evidence / Diagnostics. |
@@ -145,9 +145,25 @@ Shortcuts are scoped to the view where they are available:
 | `Ctrl+X` twice quickly | Archive/delete the selected row without confirmation. |
 | `X` | Delete inactive rows in the selected state. |
 | `m` | Enter multi-select mode. |
-| `!` | Open node-pty diagnostics and repair hints. |
+| `!` | Open node-pty diagnostics and fix steps. |
 | `?` | Open the help overlay. |
 | `Esc` | Clear a draft, or exit when the input is empty. |
+
+### Multi-select
+
+Press `m` in the main list to act on several sessions at once.
+
+| Key | Action |
+| --- | --- |
+| `Up` / `Down` / `j` / `k` | Move the selection. |
+| `Space` | Toggle the current row. |
+| `a` | Select all visible rows. |
+| `u` | Clear the selection. |
+| `d` | Confirm marking the selected inactive rows Done. |
+| `Ctrl+X` | Delete the selected Done rows (confirmation prompt). |
+| `m` / `Esc` / `Ctrl+C` | Leave multi-select mode. |
+| `?` | Open the help overlay. |
+| `!` | Open node-pty diagnostics and fix steps. |
 
 ### Peek
 
@@ -156,12 +172,13 @@ Peek shows the selected session's summary, blocker or question, latest output, a
 | Key | Action |
 | --- | --- |
 | `r` or `Enter` | Enter reply mode; type a follow-up and press `Enter` to send it without attaching. |
-| `a`, `Right`, or `>` | Attach to the session. |
+| `a`, `Right`, `>`, or `l` | Attach to the session. |
 | `v` | Open the read-only transcript. |
 | `e` | Open Evidence / Diagnostics. |
 | `d` | Confirm marking the inactive session Done. |
 | `h` | Hold or unhold the session. |
-| `Up` / `Down` | Move to the previous or next session. |
+| `!` | Open node-pty diagnostics and fix steps. |
+| `Up` / `Down` / `j` / `k` | Move to the previous or next session. |
 | `Esc` | Return to the main list. |
 
 When a Pi question or questionnaire tool is pending, inline reply is rejected; attach to answer that interactive question in the real Pi session.
@@ -172,7 +189,7 @@ The `v` view is a read-only projection of the durable Pi session JSONL. It does 
 
 | Key | Action |
 | --- | --- |
-| `Up` / `Down` | Scroll one line. |
+| `Up` / `Down` / `j` / `k` | Scroll one line. |
 | `PageUp` / `PageDown` | Scroll one page. |
 | `Space` | Open Peek. |
 | `r` | Enter reply mode. |
@@ -180,6 +197,7 @@ The `v` view is a read-only projection of the durable Pi session JSONL. It does 
 | `e` | Open Evidence / Diagnostics. |
 | `d` | Confirm marking the inactive session Done. |
 | `h` | Hold or unhold the session. |
+| `!` | Open node-pty diagnostics and fix steps. |
 | `Left` / `Esc` / `<` | Return to the main list. |
 
 ### Evidence / Diagnostics
@@ -188,11 +206,11 @@ The `e` view shows durable session evidence, including changed files, commands a
 
 | Key | Action |
 | --- | --- |
-| `Up` / `Down` | Scroll one line. |
+| `Up` / `Down` / `j` / `k` | Scroll one line. |
 | `PageUp` / `PageDown` | Scroll one page. |
 | `r` | Enter reply mode. |
 | `v` | Open the read-only transcript. |
-| `Enter`, `a`, or `Right` | Attach to the session. |
+| `Enter`, `a`, `Right`, or `l` | Attach to the session. |
 | `x` | Clear diagnostics; evidence is preserved. |
 | `Left` / `Esc` / `<` | Return to the main list. |
 
@@ -268,7 +286,7 @@ For internal code platforms (non-github/gitlab hosts) or custom CLIs, add a per-
 
 ## Attach and Fallback Behavior
 
-When PTY support is healthy, Agent Board uses an interactive PTY host for attach and start-and-attach. If PTY support is unavailable, eligible managed sessions can still run in the background through the JSON runner; start-and-attach falls back to background launch with a warning. Adopted external foreground sessions require PTY to continue safely. Press `!` in the dashboard for diagnosis and repair hints.
+When PTY support is healthy, Agent Board uses an interactive PTY host for attach and start-and-attach. If PTY support is unavailable, eligible managed sessions can still run in the background through the JSON runner; start-and-attach falls back to background launch with a warning. Adopted external foreground sessions require PTY to continue safely. Press `!` in the dashboard for diagnosis and fix steps.
 
 On Windows, PTY host control uses a named pipe and spawned child console windows are hidden. Terminal behavior can still vary between terminal emulators.
 
@@ -347,7 +365,7 @@ The command should emit an assistant reply, then an `agent_end` event, and exit.
 
 ### `node-pty unavailable`
 
-Press `!` in the dashboard to open the diagnostic panel and follow its repair hints. Common causes include a missing native `node-pty` binary, a Node/architecture mismatch, a missing or non-executable macOS `spawn-helper`, or macOS quarantine. You can temporarily set `AGENT_BOARD_DISABLE_PTY=1` to use background JSON-runner behavior where supported.
+Press `!` in the dashboard to open the diagnostic panel and follow its fix steps. Common causes include a missing native `node-pty` binary, a Node/architecture mismatch, a missing or non-executable macOS `spawn-helper`, or macOS quarantine. You can temporarily set `AGENT_BOARD_DISABLE_PTY=1` to use background JSON-runner behavior where supported.
 
 ### Attach is slow or keeps reconnecting
 

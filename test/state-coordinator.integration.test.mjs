@@ -4,8 +4,8 @@
  * talks JSONL over its socket, mirroring the pty-runner integration fixture style.
  */
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, appendFileSync, rmSync, statSync } from "node:fs";
-import { createConnection } from "node:net";
+import { existsSync, mkdtempSync, mkdirSync, appendFileSync, rmSync, statSync, writeFileSync, unlinkSync, renameSync } from "node:fs";
+import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,6 +19,7 @@ import * as P from "../src/core/paths.mjs";
 import { createRunStatus } from "../src/core/events.mjs";
 import { createView, readState, readStatus, writeState, writeStatus } from "../src/core/store.mjs";
 import { sendStateCommand } from "../src/core/coordinator-client.mjs";
+import { readDiagnostics } from "../src/core/diagnostics.mjs";
 
 const COORDINATOR_SCRIPT = fileURLToPath(new URL("../runner/state-coordinator.mjs", import.meta.url));
 const STATE_RUNNER_SCRIPT = fileURLToPath(new URL("../runner/state-runner.mjs", import.meta.url));
@@ -499,6 +500,49 @@ test("second coordinator instance exits immediately (lease held)", async (t) => 
 	const exitCode = await waitForExit(second, 2000);
 	assert.notEqual(exitCode, null, "second instance exited within 2s");
 	assert.equal(readState(root, "v1").semanticState, "queued", "second instance left state untouched");
+
+	// A11: the loser must leave a diagnostic, not just exit silently.
+	const events = readDiagnostics(root, "_coordinator");
+	const failure = events.find((e) => e.code === "coordinator_lease_unavailable");
+	assert.ok(failure, "acquisition failure is recorded");
+	assert.deepEqual(
+		Object.keys(failure.details).sort(),
+		["hasIdentity", "heartbeatAgeMs", "heartbeatMs", "lockAgeMs", "ownerPid", "reason"],
+	);
+});
+
+test("#224 A10: a stranded lease with a reused pid is reclaimed and writes resume", async (t) => {
+	const root = freshRoot();
+	let child = null;
+	t.after(async () => {
+		if (child && isAlive(child.pid)) {
+			child.kill("SIGTERM");
+			await waitForExit(child);
+		}
+		rmSync(root, { recursive: true, force: true });
+	});
+	createView(root, { id: "v1", name: "x", cwd: root });
+	const lockPath = P.viewLockPath(root, "_coordinator", "state-coordinator");
+	mkdirSync(lockPath, { recursive: true });
+	writeFileSync(join(lockPath, "owner.json"), JSON.stringify({
+		token: "stranded", pid: process.pid,
+		identity: { pid: process.pid, startToken: null },
+		startedAt: Date.now() - 48 * 3_600_000,
+	}));
+	writeFileSync(join(lockPath, "heartbeat.stranded"), JSON.stringify({ at: Date.now() - 24 * 3_600_000 }));
+
+	child = startCoordinator(root);
+	const { client } = await readyClient(root);
+	client.send({
+		type: "state_command", commandId: "a10-1", viewId: "v1",
+		source: "dashboard-user", kind: "mark_completed", expectedRevision: null, payload: {},
+	});
+	const result = await client.next();
+	assert.equal(result.status, "applied");
+
+	const reclaimed = readDiagnostics(root, "_coordinator").find((e) => e.code === "lease_reclaimed");
+	assert.ok(reclaimed, "lease_reclaimed is recorded");
+	assert.equal(reclaimed.details.eligibility, "legacy");
 });
 
  test("A8: manual completion fences a late model classification (end-to-end)", async (t) => {
@@ -1189,4 +1233,218 @@ test("host_run_failed applies through the coordinator and fences manual completi
 	assert.equal(state.processState, "exited");
 	assert.equal(state.error, "PTY host died unexpectedly");
 	assert.equal(readStatus(root, "v1", "r1").semanticState, "failed");
+});
+
+// -- Task 5: coordinator heartbeat supervision and step-down --
+
+async function startWithHeartbeatFailure(root) {
+	process.env.AGENT_BOARD_TEST_COORDINATOR_HEARTBEAT_MS = "50";
+	process.env.AGENT_BOARD_TEST_FORCE_TOUCH_FAILURE = "1";
+	return startCoordinator(root);
+}
+
+function clearHeartbeatKnobs() {
+	delete process.env.AGENT_BOARD_TEST_COORDINATOR_HEARTBEAT_MS;
+	delete process.env.AGENT_BOARD_TEST_FORCE_TOUCH_FAILURE;
+	delete process.env.AGENT_BOARD_TEST_FAIL_DIAGNOSTIC;
+}
+
+test("#224 A14: persistent heartbeat failure makes the coordinator step down", async (t) => {
+	const root = freshRoot();
+	let child = null;
+	t.after(async () => {
+		clearHeartbeatKnobs();
+		if (child && isAlive(child.pid)) {
+			child.kill("SIGTERM");
+			await waitForExit(child);
+		}
+		rmSync(root, { recursive: true, force: true });
+	});
+	createView(root, { id: "v1", name: "x", cwd: root });
+	child = await startWithHeartbeatFailure(root);
+
+	const code = await waitForExit(child, 5000);
+	assert.equal(code, 0, "clean shutdown, not a crash");
+	assert.equal(existsSync(P.viewLockPath(root, "_coordinator", "state-coordinator")), false, "lease released");
+
+	const lost = readDiagnostics(root, "_coordinator").find((e) => e.code === "coordinator_heartbeat_lost");
+	assert.ok(lost, "step-down is recorded");
+	assert.ok(lost.details.consecutiveFailures >= 3);
+
+	if (process.platform !== "win32") {
+		assert.equal(existsSync(P.coordinatorEndpointPathFor(process.platform, root)), false, "socket unlinked");
+	}
+});
+
+test("#224 A14b: a failing diagnostic write must not block the step-down", async (t) => {
+	const root = freshRoot();
+	let child = null;
+	t.after(async () => {
+		clearHeartbeatKnobs();
+		if (child && isAlive(child.pid)) {
+			child.kill("SIGTERM");
+			await waitForExit(child);
+		}
+		rmSync(root, { recursive: true, force: true });
+	});
+	createView(root, { id: "v1", name: "x", cwd: root });
+	process.env.AGENT_BOARD_TEST_FAIL_DIAGNOSTIC = "1";
+	child = await startWithHeartbeatFailure(root);
+
+	// A14b: the diagnostic append throws under this knob; the step-down must still
+	// complete cleanly (exit 0, lease released).
+	const code = await waitForExit(child, 5000);
+	assert.equal(code, 0, "diagnostic failure must not skip shutdown");
+	assert.equal(existsSync(P.viewLockPath(root, "_coordinator", "state-coordinator")), false, "lease still released");
+	if (process.platform !== "win32") {
+		assert.equal(existsSync(P.coordinatorEndpointPathFor(process.platform, root)), false, "endpoint still cleaned up");
+	}
+});
+
+test("#255 A3: a deposed coordinator keeps its own endpoint", async (t) => {
+	if (process.platform === "win32") return t.skip("POSIX AF_UNIX only");
+	const root = freshRoot();
+	let child = null;
+	t.after(async () => {
+		clearHeartbeatKnobs();
+		if (child && isAlive(child.pid)) {
+			child.kill("SIGTERM");
+			await waitForExit(child);
+		}
+		rmSync(root, { recursive: true, force: true });
+	});
+	createView(root, { id: "v1", name: "x", cwd: root });
+	process.env.AGENT_BOARD_TEST_COORDINATOR_HEARTBEAT_MS = "100";
+	child = startCoordinator(root);
+	await readyClient(root);
+	const socketPath = P.coordinatorEndpointPathFor(process.platform, root);
+	const lockPath = P.viewLockPath(root, "_coordinator", "state-coordinator");
+	assert.ok(existsSync(socketPath), "precondition: endpoint exists");
+
+	// Simulate "the lease moved elsewhere": the lock dir is quarantined away, so the
+	// holder's next touches fail (touch() returns false when stillOwns() is false).
+	rmSync(lockPath, { recursive: true, force: true });
+	assert.ok(existsSync(socketPath), "anti-vacuous: endpoint still exists right after the lease removal");
+
+	const code = await waitForExit(child, 6000);
+	assert.equal(code, 0, "clean step-down");
+	// The deposed owner must not unlink its own endpoint: restoring #70's owner-token
+	// condition means an instance that no longer holds the lease cleans nothing.
+	assert.ok(existsSync(socketPath), "a deposed owner must not unlink its own endpoint");
+});
+
+test("#255 A6: SIGTERM on a healthy owner still unlinks the endpoint", async (t) => {
+	if (process.platform === "win32") return t.skip("POSIX AF_UNIX only");
+	const root = freshRoot();
+	let child = null;
+	t.after(async () => {
+		if (child && isAlive(child.pid)) {
+			child.kill("SIGTERM");
+			await waitForExit(child);
+		}
+		rmSync(root, { recursive: true, force: true });
+	});
+	createView(root, { id: "v1", name: "x", cwd: root });
+	child = startCoordinator(root);
+	await readyClient(root);
+	const socketPath = P.coordinatorEndpointPathFor(process.platform, root);
+	assert.ok(existsSync(socketPath), "precondition: endpoint exists");
+
+	child.kill("SIGTERM");
+	const code = await waitForExit(child);
+	assert.equal(code, 0, "clean SIGTERM exit");
+	assert.equal(existsSync(socketPath), false, "healthy owner cleans its own endpoint");
+});
+
+test("#255 A4: a missing endpoint steps the coordinator down", async (t) => {
+	if (process.platform === "win32") return t.skip("POSIX AF_UNIX only");
+	const root = freshRoot();
+	let child = null;
+	t.after(async () => {
+		clearHeartbeatKnobs();
+		if (child && isAlive(child.pid)) {
+			child.kill("SIGTERM");
+			await waitForExit(child);
+		}
+		rmSync(root, { recursive: true, force: true });
+	});
+	createView(root, { id: "v1", name: "x", cwd: root });
+	process.env.AGENT_BOARD_TEST_COORDINATOR_HEARTBEAT_MS = "100";
+	child = startCoordinator(root);
+	await readyClient(root);
+	const socketPath = P.coordinatorEndpointPathFor(process.platform, root);
+	assert.ok(existsSync(socketPath), "precondition: endpoint exists");
+	unlinkSync(socketPath);
+
+	const code = await waitForExit(child, 5000);
+	assert.equal(code, 0, "clean step-down");
+	const lost = readDiagnostics(root, "_coordinator").find((e) => e.code === "coordinator_endpoint_lost");
+	assert.ok(lost, "endpoint loss is recorded");
+	assert.equal(lost.details.state, "missing");
+	assert.equal(existsSync(P.viewLockPath(root, "_coordinator", "state-coordinator")), false, "lease released");
+});
+
+test("#255 A4b: a failing diagnostic write does not block the step-down", async (t) => {
+	if (process.platform === "win32") return t.skip("POSIX AF_UNIX only");
+	const root = freshRoot();
+	let child = null;
+	t.after(async () => {
+		clearHeartbeatKnobs();
+		if (child && isAlive(child.pid)) {
+			child.kill("SIGTERM");
+			await waitForExit(child);
+		}
+		rmSync(root, { recursive: true, force: true });
+	});
+	createView(root, { id: "v1", name: "x", cwd: root });
+	process.env.AGENT_BOARD_TEST_COORDINATOR_HEARTBEAT_MS = "100";
+	process.env.AGENT_BOARD_TEST_FAIL_DIAGNOSTIC = "1";
+	child = startCoordinator(root);
+	await readyClient(root);
+	unlinkSync(P.coordinatorEndpointPathFor(process.platform, root));
+
+	const code = await waitForExit(child, 5000);
+	assert.equal(code, 0, "exit 0 even when the diagnostic append throws");
+	assert.equal(existsSync(P.viewLockPath(root, "_coordinator", "state-coordinator")), false, "lease released");
+});
+
+test("#255 A5: a replaced endpoint steps the coordinator down and the replacement survives", async (t) => {
+	if (process.platform === "win32") return t.skip("POSIX AF_UNIX only");
+	const root = freshRoot();
+	// The temp socket must live inside <root>: rename(2) is only atomic within one
+	// filesystem (EXDEV across mounts).
+	const standinPath = join(root, `.standin-${process.pid}.sock`);
+	let child = null;
+	let standin = null;
+	t.after(async () => {
+		clearHeartbeatKnobs();
+		if (child && isAlive(child.pid)) {
+			child.kill("SIGTERM");
+			await waitForExit(child);
+		}
+		if (standin) {
+			try { await new Promise((resolve) => standin.close(resolve)); } catch { /* already closed */ }
+		}
+		rmSync(root, { recursive: true, force: true });
+	});
+	createView(root, { id: "v1", name: "x", cwd: root });
+	process.env.AGENT_BOARD_TEST_COORDINATOR_HEARTBEAT_MS = "100";
+	child = startCoordinator(root);
+	await readyClient(root);
+	const socketPath = P.coordinatorEndpointPathFor(process.platform, root);
+	const beforeIno = statSync(socketPath).ino;
+	standin = createServer(() => {});
+	await new Promise((resolve, reject) => {
+		standin.once("error", reject);
+		standin.listen(standinPath, resolve);
+	});
+	renameSync(standinPath, socketPath); // atomic directory-entry replacement
+	assert.notEqual(statSync(socketPath).ino, beforeIno, "stand-in really replaced the inode");
+
+	const code = await waitForExit(child, 5000);
+	assert.equal(code, 0, "clean step-down");
+	const lost = readDiagnostics(root, "_coordinator").find((e) => e.code === "coordinator_endpoint_lost");
+	assert.ok(lost, "replacement is recorded");
+	assert.equal(lost.details.state, "replaced");
+	assert.ok(existsSync(socketPath), "the replacement endpoint must survive the step-down");
 });

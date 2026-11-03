@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, existsSync, readFileSync, statSync, mkdirSync, symlinkSync, copyFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, statSync, mkdirSync, symlinkSync, copyFileSync, unlinkSync, renameSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -883,9 +883,58 @@ test("owned runner publishes proc start tokens for runner and child identities (
 			return h?.state === "alive" && h?.readyAt != null ? h : false;
 		});
 		childPid = host.childPid;
-		assert.match(String(host.runnerIdentity?.startToken), /^\d+$/, "runnerIdentity.startToken from /proc");
-		assert.match(String(host.childIdentity?.startToken), /^\d+$/, "childIdentity.startToken from /proc");
+		const tokenPattern = process.platform === "win32" ? /^ct:\d+$/ : /^\d+$/;
+		assert.match(String(host.runnerIdentity?.startToken), tokenPattern, "runnerIdentity.startToken from /proc");
+		assert.match(String(host.childIdentity?.startToken), tokenPattern, "childIdentity.startToken from /proc");
 		assert.equal(host.childIdentity?.pid, childPid);
+	} finally {
+		try { runner?.kill("SIGKILL"); } catch {}
+		if (childPid) { try { process.kill(childPid, "SIGKILL"); } catch {} }
+		await new Promise((r) => setTimeout(r, 50));
+		rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+	}
+});
+
+test("owned runner never republishes alive after a child exits during startup", async () => {
+	const root = freshRoot();
+	let runner;
+	let childPid = null;
+	try {
+		// Reused fast-exit fixture (issue #90): boot output, then exit after 150 ms —
+		// inside the ready path's token probe window (issue #238: a microtask on
+		// linux, a PowerShell round trip on win32).
+		({ runner } = await launchOwnedRunner(root, "v1", "i238", {
+			config: { piArgsPrefix: [resolve("test-support/fake-failing-pty-pi.mjs")] },
+		}));
+		// Poll the record through the whole startup/finalize window. The guard's
+		// contract is an ordering one — a terminal record must never be overwritten
+		// by a later "alive" publish — so collect the observed sequence, not just
+		// the end value.
+		const observed = [];
+		const deadline = Date.now() + 10000;
+		while (Date.now() < deadline) {
+			const h = readHost(root, "v1");
+			if (h) {
+				if (h.childPid) childPid = h.childPid;
+				observed.push(h.state);
+			}
+			if (runner.exitCode !== null || runner.signalCode !== null) break;
+			await new Promise((r) => setTimeout(r, 2));
+		}
+		const trace = observed.filter((s, i) => i === 0 || s !== observed[i - 1]).join(" → ");
+		assert.equal(await waitForExit(runner, 8000), true, "runner exits after the child exits during startup");
+		const final = readHost(root, "v1");
+		assert.ok(final, `host record survives the runner; observed ${trace}`);
+		assert.equal(final.state, "exited", `child_exit is not a FAILED_REASONS entry; observed ${trace}`);
+		assert.equal(final.exitCode, 1);
+		assert.equal(final.childPid, null, "a terminal record records no live child");
+		assert.equal(final.readyAt, null, "a terminal record records no readyAt");
+		assert.ok(final.endedAt != null, "terminal record carries endedAt");
+		const firstTerminal = observed.findIndex((s) => s === "exited" || s === "failed");
+		assert.ok(
+			firstTerminal === -1 || !observed.slice(firstTerminal + 1).includes("alive"),
+			`no alive publish after the terminal state; observed ${trace}`,
+		);
 	} finally {
 		try { runner?.kill("SIGKILL"); } catch {}
 		if (childPid) { try { process.kill(childPid, "SIGKILL"); } catch {} }
@@ -1996,5 +2045,96 @@ test("accept-registration race: a legacy client that connects late never receive
 		try { runner?.kill("SIGTERM"); } catch {}
 		await waitForExit(runner, 5000);
 		rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+	}
+});
+
+// ---- #257: legacy pty-runner endpoint cleanup ------------------------------------------
+
+/** Boot a legacy runner: a host-config WITHOUT `instanceId` dispatches `legacyMain`, which
+ *  binds the stable `control.sock` endpoint (unlike the per-instance owned path). */
+async function bootLegacyRunner(viewId = "v1") {
+	const root = freshRoot();
+	const meta = createView(root, { id: viewId, name: "legacy-endpoint", cwd: process.cwd() });
+	const configPath = P.hostConfigPath(root, viewId);
+	atomicWriteJson(configPath, {
+		root,
+		viewId,
+		sessionFile: meta.sessionFile,
+		cwd: process.cwd(),
+		initialPrompt: null,
+		piCommand: process.execPath,
+		piArgsPrefix: [resolve("test-support/fake-pty-pi.mjs")],
+		model: null,
+		tools: null,
+		env: { AGENT_BOARD_ALLOW_PIPE_FALLBACK: "1" },
+		cols: 80,
+		rows: 24,
+	});
+	const runner = spawn(process.execPath, [resolve("runner/pty-runner.mjs"), configPath], {
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	runner.stdout.resume();
+	runner.stderr.resume();
+	await waitFor(() => hostReady(root, viewId));
+	return { root, runner, socketPath: P.controlSocketPath(root, viewId) };
+}
+
+async function stopLegacyRunner(runner, root, viewId = "v1") {
+	try { if (runner.exitCode === null) runner.kill("SIGKILL"); } catch { /* already gone */ }
+	await waitForExit(runner, 2000);
+	reapChild(root, viewId);
+	rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+}
+
+test("#257 A1: a legacy runner cleans up its own endpoint on SIGTERM", async (t) => {
+	if (process.platform === "win32") return t.skip("POSIX AF_UNIX only");
+	const { root, runner, socketPath } = await bootLegacyRunner();
+	try {
+		assert.ok(existsSync(socketPath), "precondition: endpoint exists before SIGTERM");
+		runner.kill("SIGTERM");
+		assert.equal(await waitForExit(runner, 5000), true, "runner exits");
+		assert.equal(runner.exitCode, 0, "clean SIGTERM exit");
+		assert.equal(existsSync(socketPath), false, "normal shutdown removes its own endpoint");
+	} finally {
+		await stopLegacyRunner(runner, root);
+	}
+});
+
+test("#257 A1b: a legacy runner exits cleanly when the endpoint is already gone", async (t) => {
+	if (process.platform === "win32") return t.skip("POSIX AF_UNIX only");
+	const { root, runner, socketPath } = await bootLegacyRunner();
+	try {
+		assert.ok(existsSync(socketPath), "precondition: endpoint exists");
+		unlinkSync(socketPath);
+		runner.kill("SIGTERM");
+		assert.equal(await waitForExit(runner, 5000), true, "runner exits");
+		assert.equal(runner.exitCode, 0, "ENOENT at cleanup must not crash the shutdown");
+	} finally {
+		await stopLegacyRunner(runner, root);
+	}
+});
+
+test("#257 A2: a legacy runner does not unlink a replaced endpoint", async (t) => {
+	if (process.platform === "win32") return t.skip("POSIX AF_UNIX only");
+	const { root, runner, socketPath } = await bootLegacyRunner();
+	const standinPath = join(root, `.standin-${process.pid}.sock`);
+	let standin = null;
+	try {
+		assert.ok(existsSync(socketPath), "precondition: endpoint exists");
+		const before = statSync(socketPath).ino;
+		standin = createServer(() => {});
+		await new Promise((ok, fail) => {
+			standin.once("error", fail);
+			standin.listen(standinPath, ok);
+		});
+		renameSync(standinPath, socketPath); // atomic replacement; same filesystem (inside root)
+		assert.notEqual(statSync(socketPath).ino, before, "stand-in really replaced the inode");
+		runner.kill("SIGTERM");
+		assert.equal(await waitForExit(runner, 5000), true, "runner exits");
+		assert.equal(runner.exitCode, 0, "clean SIGTERM exit");
+		assert.ok(existsSync(socketPath), "a legacy runner must not unlink an endpoint it no longer owns");
+	} finally {
+		if (standin) await new Promise((done) => standin.close(done));
+		await stopLegacyRunner(runner, root);
 	}
 });

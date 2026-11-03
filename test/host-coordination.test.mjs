@@ -3,14 +3,19 @@ import assert from "node:assert/strict";
 import {
 	canFinalizeLegacyHost,
 	canReplaceHost,
+	classifyEndpointHealth,
 	classifyProbeResult,
+	classifyUnverifiableProcess,
+	commandLineMentions,
 	isStartingWithinGrace,
 	ownsEndpoint,
 	processIdentityState,
 	sameHostOwner,
 	shouldAcceptInput,
 	shouldRetryBind,
+	shouldUnlinkEndpoint,
 	shouldYieldRunner,
+	socketIdentityObservation,
 } from "../src/core/host-coordination.mjs";
 
 test("starting claim without runnerPid is protected inside grace", () => {
@@ -25,6 +30,45 @@ test("process identity states", () => {
 	assert.equal(processIdentityState({ pid: 1, startToken: "t" }, { alive: true, startToken: "t" }, 1), "owned");
 	assert.equal(processIdentityState({ pid: 1, startToken: "t" }, { alive: true, startToken: "u" }, 1), "foreign");
 	assert.equal(processIdentityState({ pid: 1, startToken: null }, { alive: true }, 1), "unknown");
+});
+
+test("processIdentityState: an identity-bearing record is never not_started", () => {
+	assert.equal(processIdentityState({ pid: 1, startToken: "t" }, { alive: true, startToken: "t" }, null), "owned");
+	assert.equal(processIdentityState({ pid: 1, startToken: "t" }, { alive: true, startToken: "u" }, null), "foreign");
+	assert.equal(processIdentityState({ pid: 1, startToken: "t" }, { alive: false }, null), "dead");
+	assert.equal(processIdentityState({ pid: 1, startToken: "t" }, { alive: true, startToken: null }, null), "unknown");
+});
+
+test("processIdentityState: not_started needs both identity and spawnedAt to be absent", () => {
+	assert.equal(processIdentityState(null, null, null), "not_started");
+	assert.equal(processIdentityState(undefined, null, null), "not_started");
+});
+
+test("commandLineMentions normalizes slashes/case and respects path boundaries", () => {
+	assert.equal(commandLineMentions('node C:\\x\\cli.js --session "C:\\a b\\s.jsonl"', "C:/a b/s.jsonl"), true);
+	assert.equal(commandLineMentions("NODE --session c:\\A\\S.JSONL", "C:\\a\\s.jsonl"), true);
+	// prefix trap: view_abc must not match view_abcd
+	assert.equal(commandLineMentions("node x --session C:\\v\\view_abcd.jsonl", "C:\\v\\view_abc.jsonl"), false);
+	assert.equal(commandLineMentions("node x --session C:\\v\\session-2.jsonl", "C:\\v\\session.jsonl"), false);
+	// suffix trap: the fragment must not match as a prefix of a longer file name
+	assert.equal(commandLineMentions("node x --session C:\\v\\s.jsonl.bak", "C:\\v\\s.jsonl"), false);
+	assert.equal(commandLineMentions("", "C:\\v\\s.jsonl"), false);
+});
+
+test("classifyUnverifiableProcess truth table", () => {
+	const probe = (creationTimeMs, commandLine) => ({ creationTimeMs, commandLine });
+	const base = { spawnedAt: 1_000_000, expectedCommandFragment: "C:\\v\\s.jsonl", toleranceMs: 5_000 };
+	assert.equal(classifyUnverifiableProcess({ ...base, probe: null }), "unknown");
+	assert.equal(classifyUnverifiableProcess({ ...base, probe: probe(9_999_999, "node --session C:\\v\\s.jsonl") }), "owned");
+	assert.equal(classifyUnverifiableProcess({ ...base, probe: probe(9_999_999, "node other.js") }), "foreign");
+	assert.equal(classifyUnverifiableProcess({ ...base, probe: probe(1_002_000, null) }), "owned");
+	assert.equal(classifyUnverifiableProcess({ ...base, probe: probe(900_000, null) }), "foreign");
+	assert.equal(classifyUnverifiableProcess({ ...base, probe: probe(1_020_000, null) }), "foreign");
+	// command line wins over a null spawnedAt
+	assert.equal(classifyUnverifiableProcess({ ...base, spawnedAt: null, probe: probe(5, "node --session C:\\v\\s.jsonl") }), "owned");
+	// no signal at all
+	assert.equal(classifyUnverifiableProcess({ ...base, spawnedAt: null, probe: probe(1_000_000, null) }), "unknown");
+	assert.equal(classifyUnverifiableProcess({ ...base, expectedCommandFragment: null, probe: probe(1_000_000, "node x") }), "owned");
 });
 
 test("canReplaceHost refuses unknown observations", () => {
@@ -84,6 +128,40 @@ test("canFinalizeLegacyHost requires legacy record + dead pid + unreachable endp
 test("ownsEndpoint compares dev+ino", () => {
 	assert.equal(ownsEndpoint({ dev: 1, ino: 2 }, { dev: 1, ino: 2 }), true);
 	assert.equal(ownsEndpoint({ dev: 1, ino: 2 }, { dev: 1, ino: 3 }), false);
+});
+
+test("shouldUnlinkEndpoint gates on lease ownership and compromise", () => {
+	const same = { dev: 1, ino: 2 };
+	assert.equal(shouldUnlinkEndpoint({ stillOwner: true, compromised: false, bound: same, current: same }), true);
+	assert.equal(shouldUnlinkEndpoint({ stillOwner: false, compromised: false, bound: same, current: same }), false);
+	assert.equal(shouldUnlinkEndpoint({ stillOwner: true, compromised: true, bound: same, current: same }), false);
+	assert.equal(shouldUnlinkEndpoint({ stillOwner: true, compromised: false, bound: same, current: { dev: 1, ino: 3 } }), false);
+	assert.equal(shouldUnlinkEndpoint({ stillOwner: false, compromised: false, bound: same, current: { dev: 1, ino: 3 } }), false);
+	assert.equal(shouldUnlinkEndpoint({ stillOwner: true, compromised: true, bound: same, current: { dev: 1, ino: 3 } }), false);
+	assert.equal(shouldUnlinkEndpoint({ stillOwner: false, compromised: true, bound: same, current: same }), false);
+	assert.equal(shouldUnlinkEndpoint({ stillOwner: false, compromised: true, bound: same, current: { dev: 1, ino: 3 } }), false);
+	// degenerate rows: without both identities nothing may be unlinked
+	assert.equal(shouldUnlinkEndpoint({ stillOwner: true, compromised: false, bound: null, current: same }), false);
+	assert.equal(shouldUnlinkEndpoint({ stillOwner: true, compromised: false, bound: same, current: null }), false);
+});
+
+test("socketIdentityObservation maps one stat attempt", () => {
+	assert.deepEqual(socketIdentityObservation({ dev: 7, ino: 8 }, null), { kind: "ok", dev: 7, ino: 8 });
+	assert.deepEqual(socketIdentityObservation(null, "ENOENT"), { kind: "missing" });
+	assert.deepEqual(socketIdentityObservation(null, "EACCES"), { kind: "unknown" });
+	assert.deepEqual(socketIdentityObservation(null, "EBUSY"), { kind: "unknown" });
+	assert.deepEqual(socketIdentityObservation(null, "ELOOP"), { kind: "unknown" });
+});
+
+test("classifyEndpointHealth never steps down without an identity", () => {
+	const bound = { dev: 1, ino: 2 };
+	const ok = { kind: "ok", dev: 1, ino: 2 };
+	assert.equal(classifyEndpointHealth(bound, ok), "ok");
+	assert.equal(classifyEndpointHealth(bound, { kind: "ok", dev: 1, ino: 3 }), "replaced");
+	assert.equal(classifyEndpointHealth(bound, { kind: "missing" }), "missing");
+	assert.equal(classifyEndpointHealth(bound, { kind: "unknown" }), "unknown");
+	assert.equal(classifyEndpointHealth(null, ok), "unknown");
+	assert.equal(classifyEndpointHealth(bound, null), "unknown");
 });
 
 test("classifyProbeResult maps probe snapshots", () => {
