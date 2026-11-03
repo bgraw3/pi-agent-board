@@ -59,6 +59,27 @@ test("chunked upload is retained and projected as a complete valid upload", asyn
 	assert.equal((line.match(/A/g) ?? []).length, 12000);
 });
 
+test("authoritative resnapshot drops an in-flight chunked upload before accepting new image data", async (t) => {
+	const f = fixture(t);
+	await f.feed(`\x1b[2;1H${apc("a=T,f=100,i=42,c=5,r=2,m=1", "stale")}`);
+	await f.feed(`\x1b[3;1H${apc("a=T,f=100,i=43,c=5,r=2,m=1", "fresh-")}${apc("m=0", "image")}`, true);
+	const line = f.project()[2];
+	assert.ok(line.includes("i=43"), "the resnapshot image is placed");
+	assert.ok(line.includes("fresh-image"), "new chunks are assembled together");
+	assert.ok(!line.includes("stale"), "old transmission data is discarded");
+	assert.ok(f.project().every((projected) => !projected.includes("i=42")));
+});
+
+test("reset token clears a partial upload in parser order within one write", async (t) => {
+	const f = fixture(t);
+	const before = f.images.transform(apc("a=T,f=100,i=42,c=5,r=2,m=1", "stale"));
+	const after = f.images.transform(`\x1b[3;1H${upload(43)}`, true);
+	await new Promise((resolve) => f.term.write(before + after, resolve));
+	const line = f.project()[2];
+	assert.ok(line.includes("i=43") && line.includes("aGVsbG8="));
+	assert.ok(!line.includes("stale") && !line.includes("i=42"));
+});
+
 test("separate transmit and cropped placement keeps the placement cursor and geometry", async (t) => {
 	const f = fixture(t);
 	await f.feed(apc("a=t,f=100,i=42", "aGVsbG8="));

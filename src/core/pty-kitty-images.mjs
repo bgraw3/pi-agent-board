@@ -132,7 +132,11 @@ export function createPtyKittyImages(term, onClearScrollback = () => {}) {
 	// private OSC token. Its handler runs after ALL preceding cursor movements,
 	// including movements earlier in the same async xterm.write call.
 	const handler = term.parser.registerOscHandler(OSC, (token) => {
-		if (token === "reset") { clearPlacements(); return true; }
+		if (token === "reset") {
+			clearPlacements();
+			transmission = null;
+			return true;
+		}
 		const sequence = pending.get(token);
 		pending.delete(token);
 		if (sequence) accept(sequence);
@@ -196,6 +200,8 @@ export function createPtyKittyImages(term, onClearScrollback = () => {}) {
 				// Keep the FIRST APC's row count consistent with the actual placement:
 				// Pi uses it to reserve/pre-clear rows before drawing a Kitty image.
 				const uploadHeader = { ...image.uploadControls, c: controls.c, r: controls.r };
+				// Re-uploading on each projected render is idempotent but can resend large
+				// payloads; upload-once/place-only would need host-terminal cache tracking.
 				const upload = `${PREFIX}${controlsString(uploadHeader)}${image.sequence.slice(image.sequence.indexOf(";"))}`;
 				// The outer TUI supplies the screen row; only the column is adjusted.
 				out[targetRow] = `\x1b7\x1b[${p.col + 1}G${upload}${command(controlsString(controls))}\x1b8${out[targetRow]}`;
