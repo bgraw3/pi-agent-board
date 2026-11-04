@@ -4449,8 +4449,7 @@ if (isMain) {
 		: runCaseDiag({ caseId: cli.caseId, artifactDir: cli.artifactDir });
 	run
 		.then((result) => {
-			process.stdout.write(JSON.stringify(result) + "\n");
-			process.exit(0);
+			process.stdout.write(JSON.stringify(result) + "\n", () => process.exit(0));
 		})
 		.catch((err) => {
 			process.stderr.write(`pty-attach-ready-scenario: battery harness error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
