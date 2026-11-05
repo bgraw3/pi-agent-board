@@ -234,3 +234,42 @@ test("image cache evicts oldest uploads rather than growing without bound", asyn
 	assert.equal([...line.matchAll(/a=p,/g)].length, 32);
 	assert.ok(line.includes("i=33,"));
 });
+
+test("plain chunks keep their string identity even after an image was uploaded", async (t) => {
+	const f = fixture(t);
+	await f.feed(upload());
+	const plain = "plain text after image";
+	assert.equal(f.images.transform(plain), plain, "identity preserved for later non-image chunks");
+});
+
+test("a reset with live placements still emits the reset token", async (t) => {
+	const f = fixture(t);
+	await f.feed(upload());
+	assert.ok(f.project().some((line) => line.includes("a=p")));
+	await f.feed("\x1b[2J\x1b[Hclean", true);
+	assert.ok(f.project().every((line) => !line), "placements cleared by the parser-ordered reset");
+});
+
+test("hasPlacements() reports whether project() can emit anything", async (t) => {
+	const f = fixture(t);
+	assert.equal(f.images.hasPlacements(), false, "empty before any image");
+	await f.feed(upload());
+	assert.equal(f.images.hasPlacements(), true);
+	await f.feed(apc("a=d,d=A"));
+	assert.equal(f.images.hasPlacements(), false, "cleared after deleting all placements");
+});
+
+test("a reset during an in-flight chunked upload does not pass through (CR #275)", async (t) => {
+	const f = fixture(t);
+	// Mid-flight chunked upload: transmission open, no placement yet.
+	await f.feed(apc("a=T,f=100,i=42,c=5,r=2,m=1", "A".repeat(4000)));
+	// A reset carrying no Kitty content must NOT take the fast path, so the
+	// parser-ordered reset token still runs and drops the stale transmission.
+	await f.feed("\x1b[2J\x1b[Hfresh", true);
+	// A new upload after the reset must start clean, not append to the old chunks.
+	await f.feed(apc("a=T,f=100,i=7,c=5,r=2,C=1", "aGVsbG8="));
+	const line = f.project()[0];
+	assert.ok(line.includes("i=7"), "fresh image stored");
+	assert.ok(line.includes("aGVsbG8="), "fresh payload intact");
+	assert.ok(!line.includes("AAAA"), "no stale bytes from the interrupted upload");
+});
