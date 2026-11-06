@@ -248,6 +248,7 @@ Press `/` to enter filter mode. Filter tokens are case-insensitive and can be co
 ```text
 s:running
 s:hold
+pr:227
 review:ready
 diag:stalled
 evidence:error
@@ -256,11 +257,13 @@ steer:awaiting-approval
 ```
 
 - `s:<state>` matches a state prefix, including display-label aliases such as `needs-answer`.
+- A bare PR number (e.g. `227` or `#227`) matches extracted PR/MR references as you type (`2` → `22` → `227`). Names, latest summaries, and working directories are also searched; the full transcript is not scanned. Matches come from the board's persisted reference evidence, not a live GitHub search.
+- `pr:<number>` remains available for an exact PR/MR-number match (including secondary refs), excluding issue-only refs. `pr:#227` and `pr:!227` also work.
 - `review:ready` finds sessions with review-ready evidence.
 - `evidence:error` finds sessions whose evidence contains errors.
 - `queued:true` (also `yes` or `1`) finds sessions with queued follow-ups.
 - `steer:<state>` filters by a persisted steering state.
-- Bare words match name, summary, and working directory; multiple words use AND matching.
+- Bare words match name, latest summary, working directory, and extracted PR numbers; multiple words use AND matching.
 
 `diag:stalled` can consume persisted stalled diagnostics, but the current runner does not provide a general provider-stall detector. It should not be read as a complete automatic stall-detection feature.
 
