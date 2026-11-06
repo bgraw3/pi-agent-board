@@ -6,6 +6,7 @@ import { createConnection, type Socket } from "node:net";
 import type { Component, KeybindingsManager, RgbColor, TUI, TerminalColorScheme, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { CURSOR_MARKER, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { resolveAttachDeleteKey } from "../core/attach-delete.mjs";
+import { resolveAttachDetachChord } from "../core/attach-detach.mjs";
 import { createAttachScreenOwnerState, installAttachScreenOwnerObservers } from "../core/attach-screen-owner.mjs";
 import { createPtyKittyImages } from "../core/pty-kitty-images.mjs";
 import { findHttpUrlAtCells, findWordRangeAtCells } from "../core/pty-links.mjs";
@@ -597,25 +598,11 @@ export class PtyAttachComponent implements Component {
 			this.send({ type: "input", data });
 			return;
 		}
-		if (matchesKey(data, "ctrl+\\")) {
-			// Unconditional, terminal-independent escape (issue #126): 0x1c is a
-			// single raw ASCII byte every terminal forwards unchanged in raw
-			// mode — no modifier-encoding dependency like Ctrl+Left (macOS
-			// Terminal.app never emits it, WezTerm consumes it for tab
-			// switching). Only caveat (documented in README): layouts where
-			// `\` sits on AltGr may never produce this byte; the escape ladder
-			// still covers those. matchesKey also covers the kitty CSI-u and
-			// modifyOtherKeys encodings of the same chord.
-			this.detach();
-			return;
-		}
-		if (matchesKey(data, Key.ctrl("left"))) {
-			// Explicit detach chord (issue #89): single ← is gated on editor state
-			// (it doubles as cursor-left inside a non-empty draft), so a user with
-			// a draft had no way out short of Ctrl+C/D, which kills the child Pi.
-			// Ctrl+← is unambiguous intent — detach unconditionally, regardless of
-			// editor state or socket liveness (same always-exitable guarantee as
-			// the disconnected-← escape, issue #48).
+		if (resolveAttachDetachChord(data)) {
+			// Issue #266: unconditional detach chords — Ctrl+\ (raw 0x1c, #126),
+			// Ctrl+← (#89) and Alt+H (vim h = left). Bare ← stays gated on the
+			// pushed editor_state; a chord needs no gate. Rationale and the
+			// encoding matrix live in src/core/attach-detach.mjs.
 			this.detach();
 			return;
 		}
@@ -741,7 +728,7 @@ export class PtyAttachComponent implements Component {
 			? this.theme.fg("accent", this.theme.bold(` Delete "${truncateToWidth(this.opts.title, 24, "")}"? `)) +
 			  this.theme.fg("muted", "y confirms · any other key cancels")
 			: this.theme.fg("accent", this.theme.bold(` ${this.opts.title} `)) +
-			  this.theme.fg("muted", `${this.status} · opens links · drag selects+copies · Ctrl+←/Ctrl+\\ detach`);
+			  this.theme.fg("muted", `${this.status} · links · select+copy · Ctrl+←/Ctrl+\\/Alt+H detach`);
 		return [clip(header, width), ...body.map((l) => clipTerminalLine(l, width)), this.theme.fg("dim", "─".repeat(width))];
 	}
 
@@ -757,7 +744,7 @@ export class PtyAttachComponent implements Component {
 		out.push(center(this.theme.fg("accent", this.theme.bold(title)), width));
 		out.push(center(this.theme.fg("muted", detail), width));
 		out.push("");
-		out.push(center(this.theme.fg("dim", "Ctrl+←/Ctrl+\\ to detach"), width));
+		out.push(center(this.theme.fg("dim", "Ctrl+←/Ctrl+\\/Alt+H to detach"), width));
 		while (out.length < height) out.push("");
 		return out.slice(0, height);
 	}
