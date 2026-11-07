@@ -108,7 +108,6 @@ export class AttachFrameReporter {
 	#lastMetadata = null;
 	#suspensions = 0;
 	#latestFact = null;
-	#pendingAfterDispose = [];
 	#superseding = false;
 	#instanceId = null;
 	#intentRequestId = null;
@@ -118,8 +117,12 @@ export class AttachFrameReporter {
 	#seenRequestIds = new Set();
 	#consumedRequestIds = new Set();
 	#intentId = 0;
+	#writtenFrames = new Set(); // frameId where S was successfully written to underlying terminal
+	#onUnavailable = () => {};
+	#failCapabilityCalled = false;
+	#stashedEvaluator = null; // old evaluator with deferred decisions, drained after #attachTerminal
 
-	constructor({ ui, send = (_message) => {}, mode = "fullscreen", rendererEpoch = 1, sessionEpoch = 0, now = () => Date.now() }) {
+	constructor({ ui, send = (_message) => {}, mode = "fullscreen", rendererEpoch = 1, sessionEpoch = 0, now = () => Date.now(), onUnavailable = () => {} }) {
 		if (!ui || typeof ui.setWidget !== "function") throw new Error("AttachFrameReporter requires ctx.ui.setWidget");
 		if (!MODES.has(mode)) throw new Error(`unknown renderer mode: ${mode}`);
 		this.#ui = ui;
@@ -128,6 +131,7 @@ export class AttachFrameReporter {
 		this.#rendererEpoch = rendererEpoch;
 		this.#sessionEpoch = sessionEpoch;
 		this.#now = now;
+		this.#onUnavailable = onUnavailable;
 		this.#evaluator = new FrameCandidateEvaluator({ mode, rendererEpoch, sessionEpoch, frameIdCounter: this.#frameIdCounter });
 	}
 
@@ -290,6 +294,8 @@ export class AttachFrameReporter {
 		this.#seenRequestIds.add(message.requestId);
 		this.#intentsApplied += 1;
 		this.#evaluator.setIntent({ intentId: this.#intentId, geometryRevision: message.geometryRevision, cols: message.cols, rows: message.rows });
+		// Drain any abort decisions from setIntent (intent-superseded/intent-invalid)
+		this.#drainTerminalDecisions();
 		const requested = this.#requestRender();
 		return { ok: true, requested, geometryRevision: this.#geometryRevision };
 	}
@@ -307,10 +313,16 @@ export class AttachFrameReporter {
 		return false;
 	}
 
-	/** Renderer mode change: carry the frameId counter, rebind the grammar. */
+	/** Renderer mode change: carry the frameId counter, rebind the grammar.
+	 *  The old evaluator's deferred decisions are drained immediately if the terminal
+	 *  is already bound; otherwise stashed for #createSentinel to drain after attach. */
 	setMode(mode, { rendererEpoch = this.#rendererEpoch + 1 } = {}) {
 		if (!MODES.has(mode)) throw new Error(`unknown renderer mode: ${mode}`);
-		const produced = this.#evaluator.abort("mode-changed");
+		// Capture the old evaluator so its deferred decisions can be drained after
+		// the new one is installed and the terminal is re-bound.
+		const oldEvaluator = this.#evaluator;
+		oldEvaluator.abandonPendingEscape();
+		oldEvaluator.abort("mode-changed");
 		this.#mode = mode;
 		this.#rendererEpoch = rendererEpoch;
 		this.#evaluator = new FrameCandidateEvaluator({
@@ -321,15 +333,23 @@ export class AttachFrameReporter {
 		});
 		this.#sentinelTui = null;
 		this.#focusApi = "unknown";
-		return produced;
+		// Drain immediately if terminal is bound; otherwise stash for later
+		if (this.#terminalWrite !== null) {
+			this.#drainTerminalDecisions(oldEvaluator);
+		} else {
+			this.#stashedEvaluator = oldEvaluator;
+		}
+		return [];
 	}
 
 	/** Session-scoped teardown: stop proving and restore every own shadow. */
 	dispose(reason = "dispose") {
-		const produced = this.#evaluator.stop();
+		this.#evaluator.stop();
+		// Drain stop decisions BEFORE flipping state to disposed (otherwise #emitA's enabled guard swallows them)
+		this.#drainTerminalDecisions();
 		const restores = this.#restoreShadows(reason);
 		this.#state = "disposed";
-		return { decisions: produced, restores };
+		return { restores };
 	}
 
 	#createSentinel(tui) {
@@ -352,6 +372,12 @@ export class AttachFrameReporter {
 			if (this.#state === "enabled") this.#state = "unsupported";
 		}
 		this.#attachTerminal(tui);
+		// Drain any stashed old evaluator's deferred decisions AFTER the terminal is bound
+		if (this.#stashedEvaluator !== null) {
+			this.#stashedEvaluator.abandonPendingEscape();
+			this.#drainTerminalDecisions(this.#stashedEvaluator);
+			this.#stashedEvaluator = null;
+		}
 		return {
 			render: () => {
 				this.#renderPasses += 1;
@@ -373,7 +399,9 @@ export class AttachFrameReporter {
 				// A disposed sentinel always aborts the open candidate. Only a REAL teardown
 				// (not the disposal that a re-registration triggers synchronously) stops
 				// proving and restores the wrappers.
-				this.#pendingAfterDispose.push(...this.#evaluator.abort("sentinel-dispose"));
+				this.#evaluator.abort("sentinel-dispose");
+				// Drain abort decisions before restoring shadows
+				this.#drainTerminalDecisions();
 				if (this.#superseding) return;
 				this.#restoreShadows("sentinel-dispose");
 				this.#terminal = null;
@@ -398,6 +426,9 @@ export class AttachFrameReporter {
 			this.#state = "unsupported";
 			return;
 		}
+		// Capture the old evaluator before replacing it (may be a stashed one from stop)
+		const oldEvaluator = this.#stashedEvaluator ?? this.#evaluator;
+		this.#stashedEvaluator = null;
 		this.#rendererEpoch += 1;
 		this.#mode = observed;
 		this.#evaluator = new FrameCandidateEvaluator({
@@ -408,6 +439,10 @@ export class AttachFrameReporter {
 		});
 		this.#sentinelTui = tui;
 		this.#attachTerminal(tui);
+		// Drain the OLD evaluator's deferred decisions AFTER re-binding the terminal.
+		// Abandon any pending cross-write escape first so deferred decisions are not lost.
+		oldEvaluator.abandonPendingEscape();
+		this.#drainTerminalDecisions(oldEvaluator);
 	}
 
 	#attachTerminal(tui) {
@@ -440,6 +475,8 @@ export class AttachFrameReporter {
 			const getter = () => {
 				const value = ownBefore !== undefined ? ownBefore.get.call(terminal) : typeof descriptor?.get === "function" ? descriptor.get.call(terminal) : undefined;
 				this.#evaluator.sizeRead(key, value);
+				// Drain any abort decisions from sizeRead (resampled)
+				this.#drainTerminalDecisions();
 				return value;
 			};
 			try {
@@ -456,7 +493,7 @@ export class AttachFrameReporter {
 			const wrapper = (...args) => {
 				const text = typeof args[0] === "string" ? args[0] : "";
 				if (this.#state !== "enabled") return original.apply(terminal, args);
-				const { pending, insertions } = this.#proveOnOperation(key, text);
+				const { insertions } = this.#proveOnOperation(key, text);
 				let failed = false;
 				try {
 					if (insertions.length === 0) return original.apply(terminal, args);
@@ -492,24 +529,25 @@ export class AttachFrameReporter {
 					// instead of claiming completion (S, if any, must be closed by A), then
 					// rethrow the ORIGINAL error unchanged.
 					failed = true;
-					for (const decision of this.#evaluator.abort("write-failed")) {
-						if (decision.kind === "A") this.#emitA(decision.frameId, decision.reason);
+					// Mark any unemitted S decisions as emitted before aborting:
+					// the S insertion point has passed and the S was never written, so the
+					// drain must not throw on them. Use the non-consuming decisions getter
+					// to avoid dropping deferred F/A decisions from earlier writes.
+					for (const decision of this.#evaluator.decisions) {
+						if (decision.kind === "S" && !decision.emitted) this.#evaluator.markEmitted(decision.seq);
 					}
+					this.#evaluator.abort("write-failed");
 					throw error;
 				} finally {
 					// NB: no `return` here — a return inside `finally` would swallow the
 					// original write error rethrown above.
 					if (!failed) {
 						// Completion rechecks the LATEST focus identity/mode/overlay before any F.
-						const finished = this.#evaluator.finishWrite(this.#latestFact);
-						for (const decision of finished) {
-							if (decision.kind === "F") this.#emitF(decision);
-							else if (decision.kind === "A") this.#emitA(decision.frameId, decision.reason);
-						}
-						for (const decision of pending) {
-							if (decision.kind === "A") this.#emitA(decision.frameId, decision.reason);
-						}
+						this.#evaluator.finishWrite(this.#latestFact);
+						// F/A decisions are now in the evaluator; drain them below.
 					}
+					// Drain all pending F/A decisions (including write-failed aborts).
+					this.#drainTerminalDecisions();
 				}
 			};
 			try {
@@ -526,6 +564,13 @@ export class AttachFrameReporter {
 			const wrapper = (...args) => {
 				if (this.#state === "enabled") {
 					this.#evaluator.abort(`terminal-${key}`);
+					// If a cross-write escape is pending, the abort decision is deferred.
+					// Stash the evaluator so reactivation can drain it after re-binding.
+					if (this.#evaluator.pendingEscape) {
+						this.#stashedEvaluator = this.#evaluator;
+					}
+					// Drain abort decisions before restoring shadows (may be deferred by pendingEscape)
+					this.#drainTerminalDecisions();
 					if (key === "stop") {
 						// A renderer stop (mode switch / teardown) aborts the candidate and
 						// detaches the adapter, but the capability stays armed: the next
@@ -567,9 +612,8 @@ export class AttachFrameReporter {
 	}
 
 	#proveOnOperation(kind, text) {
-		const { decisions, insertions } = this.#evaluator.op({ kind, text });
-		const pending = decisions.filter((decision) => decision.kind === "A");
-		return { pending, insertions };
+		const { insertions } = this.#evaluator.op({ kind, text });
+		return { insertions };
 	}
 
 	#writeMarker(text) {
@@ -605,9 +649,21 @@ export class AttachFrameReporter {
 		const frameId = insertion.frameId;
 		const decision = this.#evaluator.decisions.filter((entry) => entry.kind === "S" && entry.frameId === frameId).at(-1) ?? null;
 		try {
-			this.#writeMarker(encodeFrameMarkerS({ token: this.#token, frameId, intentId: decision?.intentId ?? 0, sampledCols: decision?.cols }));
+			const success = this.#writeMarker(encodeFrameMarkerS({ token: this.#token, frameId, intentId: decision?.intentId ?? 0, sampledCols: decision?.cols }));
+			if (success) {
+				this.#writtenFrames.add(frameId);
+				// FIFO eviction to keep the set bounded (align with runner MAX_FINISHED_FRAME_IDS=4096)
+				if (this.#writtenFrames.size > 4096) {
+					const oldest = this.#writtenFrames.values().next().value;
+					this.#writtenFrames.delete(oldest);
+				}
+			}
 		} catch (error) {
 			this.#failCapability(`marker-encode-failed:${error instanceof Error ? error.message : String(error)}`);
+		} finally {
+			// Mark as emitted regardless of success: S can only be emitted at this write boundary.
+			// If write failed, the candidate will be aborted and A will be sent via drain.
+			if (decision?.seq !== undefined) this.#evaluator.markEmitted(decision.seq);
 		}
 	}
 
@@ -643,6 +699,40 @@ export class AttachFrameReporter {
 		if (this.#markerFailure === null) this.#markerFailure = { at: this.#now(), reason };
 		this.#unknown.push({ what: "marker", reason });
 		this.#state = "failed";
+		if (!this.#failCapabilityCalled) {
+			this.#failCapabilityCalled = true;
+			this.#onUnavailable(reason);
+		}
+	}
+
+	/** Drain pending F/A decisions from the given evaluator (defaults to current).
+	 *  S is emitted inline in the write wrapper and marked emitted immediately;
+	 *  F/A are only emitted here. Skips emission if a cross-write escape is pending
+	 *  or the terminal is not bound (deferred until #attachTerminal completes).
+	 *  Call abandonPendingEscape() first when replacing the evaluator to force-drain. */
+	#drainTerminalDecisions(evaluator = this.#evaluator) {
+		if (evaluator.pendingEscape) {
+			// A cross-write control sequence is unclosed; defer F/A emission to avoid
+			// inserting a marker mid-sequence (which would corrupt the stream).
+			return;
+		}
+		if (this.#terminalWrite === null) {
+			// Terminal is detached (e.g. after terminal-stop). Defer emission until
+			// #attachTerminal re-binds the raw write.
+			return;
+		}
+		const decisions = evaluator.collectTerminalDecisions();
+		for (const decision of decisions) {
+			if (decision.kind === "S") {
+				throw new Error("S decision in drain: programming error");
+			} else if (decision.kind === "F") {
+				this.#emitF(decision);
+			} else if (decision.kind === "A") {
+				if (this.#writtenFrames.has(decision.frameId)) {
+					this.#emitA(decision.frameId, decision.reason);
+				}
+			}
+		}
 	}
 }
 

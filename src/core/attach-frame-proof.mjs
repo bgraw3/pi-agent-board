@@ -372,6 +372,8 @@ export class FrameCandidateEvaluator {
 	#inOp = false;
 	#pending = null;
 	#streamOffset = 0;
+	#lastCollectedSeq = 0;
+	#nextSeq = 0;
 
 	constructor({ mode, rendererEpoch = 1, sessionEpoch = 0, frameIdCounter = { value: 0 } }) {
 		if (!MODES.has(mode)) throw new Error(`unknown renderer mode: ${mode}`);
@@ -405,8 +407,38 @@ export class FrameCandidateEvaluator {
 		return this.#decisions.slice();
 	}
 
+	/** Whether a cross-write escape sequence is pending (unclosed). */
+	get pendingEscape() {
+		return this.#pending !== null;
+	}
+
+	/** Abandon any pending cross-write escape and return whether one was abandoned.
+	 *  Used before replacing the evaluator so deferred F/A decisions can be drained. */
+	abandonPendingEscape() {
+		if (this.#pending === null) return false;
+		this.#pending = null;
+		return true;
+	}
+
 	get markerFailures() {
 		return this.#markerFailures;
+	}
+
+	/** Collect decisions that have not been collected yet, ordered by absolute seq. */
+	collectTerminalDecisions() {
+		const result = this.#decisions
+			.filter(d => d.seq > this.#lastCollectedSeq && !d.emitted)
+			.sort((a, b) => a.seq - b.seq);
+		if (result.length > 0) {
+			this.#lastCollectedSeq = Math.max(...result.map(d => d.seq));
+		}
+		return result;
+	}
+
+	/** Mark a decision as emitted so collectTerminalDecisions never returns it again. */
+	markEmitted(seq) {
+		const decision = this.#decisions.find(d => d.seq === seq);
+		if (decision) decision.emitted = true;
 	}
 
 	/**
@@ -613,7 +645,7 @@ export class FrameCandidateEvaluator {
 			protocol: FRAME_WITNESS_PROTOCOL,
 			cols: decision.cols,
 			rows: decision.rows,
-			mode: this.#mode,
+			mode: decision.mode ?? this.#mode,
 			rendererEpoch: decision.rendererEpoch ?? this.#rendererEpoch,
 			sessionEpoch: this.#sessionEpoch,
 			focusPresent: decision.focusPresent === true,
@@ -839,6 +871,7 @@ export class FrameCandidateEvaluator {
 	#push(decision) {
 		const candidate = this.#candidate;
 		const isProof = decision.kind === "S" || decision.kind === "F";
+		this.#nextSeq += 1;
 		this.#decisions.push({
 			kind: decision.kind,
 			frameId: decision.frameId === null || decision.frameId === undefined ? null : decision.frameId,
@@ -851,6 +884,8 @@ export class FrameCandidateEvaluator {
 			overlayPresent: isProof && candidate !== null && candidate.sentinel !== null ? Boolean(candidate.sentinel.overlayPresent) : null,
 			intentId: isProof && candidate !== null ? candidate.intentId : null,
 			geometryRevision: isProof && candidate !== null ? candidate.geometryRevision : null,
+			seq: this.#nextSeq,
+			emitted: false,
 		});
 		if (this.#decisions.length > MAX_DECISION_LOG) this.#decisions.splice(0, this.#decisions.length - MAX_DECISION_LOG);
 	}

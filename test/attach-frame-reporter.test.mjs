@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { AttachFrameReporter, ATTACH_FRAME_WIDGET_KEY, negotiateFrameWitness } from "../src/core/attach-frame-reporter.mjs";
 import { decodeFrameMarker } from "../src/core/attach-frame-proof.mjs";
+import { createFrameStreamParser } from "../src/core/attach-frame-stream.mjs";
 
 const OPEN = "\u001b[?2026h";
 const CLOSE = "\u001b[?2026l";
@@ -92,7 +93,9 @@ function enabledReporter(options = {}) {
 	const { terminal, written } = createTerminalDouble(options);
 	const { ui, widgets, tui } = createUiDouble(terminal);
 	const sent = [];
-	const reporter = new AttachFrameReporter({ ui, mode: "fullscreen", sessionEpoch: 1, send: (message) => sent.push(message) });
+	const mode = options.mode ?? "fullscreen";
+	tui.mode = mode;
+	const reporter = new AttachFrameReporter({ ui, mode, sessionEpoch: 1, send: (message) => sent.push(message), onUnavailable: options.onUnavailable });
 	reporter.announce();
 	assert.equal(reporter.handleMessage({ type: "frame_witness_enable", protocol: 1, token: TOKEN, instanceId: "inst-1", sessionEpoch: 1 }).status, "enabled");
 	assert.equal(reporter.install(), true);
@@ -484,4 +487,177 @@ test("23b2c3a cross-instance dispose: another Terminal instance on the same prot
 	assert.equal(second.columns, 80);
 	assert.equal(Object.hasOwn(second, "write"), false, "no own shadow leaked to the sibling");
 	void written;
+});
+
+test("drainTerminalDecisions emits A for written frames only", () => {
+	const { reporter, terminal, written, renderPass } = enabledReporter({ mode: "regular" });
+	renderPass();
+	// Write OPEN + content (no CLOSE yet) — regular mode emits S on sync-open
+	terminal.write(`${OPEN}text`);
+	// Now trigger an abort via applyIntent while candidate is still open
+	reporter.applyIntent({ type: "frame_witness_intent", instanceId: "inst-1", requestId: "fw-1", geometryRevision: 1, cols: 80, rows: 24 });
+	// The old candidate should be aborted and A emitted via drain
+	const markers = written.map(decodeFrameMarker).filter(Boolean);
+	assert(markers.some(m => m.kind === "A"));
+});
+
+test("sizeRead resample aborts previous candidate via drain", () => {
+	const { reporter, terminal, written, renderPass } = enabledReporter({ mode: "regular" });
+	renderPass();
+	terminal.write(`${OPEN}text`);
+	// Trigger resample via size read
+	void terminal.columns;
+	void terminal.rows;
+	// New candidate opens
+	renderPass();
+	terminal.write(`${OPEN}text${CLOSE}`);
+	const markers = written.map(decodeFrameMarker).filter(Boolean);
+	// Should have S(1), A(1), S(2) in order
+	const kinds = markers.map(m => m.kind);
+	assert.deepEqual(kinds, ["S", "A", "S"]);
+});
+
+test("setMode mode-changed aborts via drain before evaluator replacement", () => {
+	const { reporter, terminal, written, renderPass } = enabledReporter({ mode: "regular" });
+	renderPass();
+	terminal.write(`${OPEN}text`);
+	// Directly call setMode to trigger mode change
+	reporter.setMode("fullscreen");
+	const markers = written.map(decodeFrameMarker).filter(Boolean);
+	assert(markers.some(m => m.kind === "A" && m.reason === "mode-changed"));
+});
+
+test("terminal-stop aborts via drain before restoring shadows", () => {
+	const { reporter, terminal, written, renderPass } = enabledReporter({ mode: "regular" });
+	renderPass();
+	terminal.write(`${OPEN}text`);
+	terminal.stop();
+	const markers = written.map(decodeFrameMarker).filter(Boolean);
+	assert(markers.some(m => m.kind === "A" && m.reason === "terminal-stop"));
+});
+
+test("sentinel dispose aborts via drain before restoring shadows", () => {
+	const { reporter, terminal, written, renderPass, widget } = enabledReporter({ mode: "regular" });
+	renderPass();
+	terminal.write(`${OPEN}text`);
+	widget.component.dispose();
+	const markers = written.map(decodeFrameMarker).filter(Boolean);
+	assert(markers.some(m => m.kind === "A" && m.reason === "sentinel-dispose"));
+});
+
+test("dispose aborts via drain before state flip", () => {
+	const { reporter, terminal, written, renderPass } = enabledReporter({ mode: "regular" });
+	renderPass();
+	terminal.write(`${OPEN}text`);
+	reporter.dispose("test");
+	const markers = written.map(decodeFrameMarker).filter(Boolean);
+	assert(markers.some(m => m.kind === "A"));
+});
+
+test("onUnavailable is called on marker failure", () => {
+	const onUnavailableCalls = [];
+	const { reporter, terminal, written, renderPass } = enabledReporter({
+		onUnavailable: (reason) => onUnavailableCalls.push(reason),
+		failWrite: { mode: "throw", matches: (text) => text.startsWith("\u001bP>") },
+	});
+	renderPass();
+	terminal.write(FULL);
+	assert.equal(reporter.state, "failed");
+	assert.equal(onUnavailableCalls.length, 1);
+});
+
+test("chained parser: no protocol errors after reporter cancellation paths", () => {
+	const { reporter, terminal, written, renderPass } = enabledReporter({ mode: "regular" });
+	renderPass();
+	terminal.write(`${OPEN}text`);
+	reporter.applyIntent({ type: "frame_witness_intent", instanceId: "inst-1", requestId: "fw-1", geometryRevision: 1, cols: 80, rows: 24 });
+	const parser = createFrameStreamParser({ token: TOKEN, instanceId: "inst-1", sessionEpoch: 1 });
+	for (const chunk of written) parser.push(chunk);
+	const { diagnostics } = parser.snapshot();
+	assert.equal(diagnostics.length, 0, `no protocol errors: ${JSON.stringify(diagnostics)}`);
+});
+
+test("chained parser: no protocol errors after mode change", () => {
+	const { reporter, terminal, written, renderPass } = enabledReporter({ mode: "regular" });
+	renderPass();
+	terminal.write(`${OPEN}text`);
+	reporter.setMode("fullscreen");
+	const parser = createFrameStreamParser({ token: TOKEN, instanceId: "inst-1", sessionEpoch: 1 });
+	for (const chunk of written) parser.push(chunk);
+	const { diagnostics } = parser.snapshot();
+	assert.equal(diagnostics.length, 0, `no protocol errors: ${JSON.stringify(diagnostics)}`);
+});
+
+test("stashed evaluator: torn-escape + stop + mode-differing re-registration delivers deferred A", () => {
+	const { reporter, terminal, written, renderPass, tui } = enabledReporter({ mode: "regular" });
+	renderPass();
+	// Write OPEN + text (S emitted), then a write ending mid-escape (torn)
+	terminal.write(`${OPEN}text`);
+	terminal.write("\u001b[1;"); // torn CSI escape
+	// Stop the terminal (A deferred by pendingEscape guard, terminal nulled)
+	terminal.stop();
+	// Re-register with a differing mode (triggers setMode + #createSentinel)
+	tui.mode = "fullscreen";
+	reporter.install();
+	// The deferred A for frameId 1 should now be emitted
+	const markers = written.map(decodeFrameMarker).filter(Boolean);
+	const aMarkers = markers.filter(m => m.kind === "A");
+	assert.equal(aMarkers.length, 1, "deferred A is emitted after re-registration");
+	assert.equal(aMarkers[0].frameId, 1);
+	assert.equal(reporter.state, "enabled", "capability stays enabled");
+	// Chained parser: no open candidate, no diagnostics
+	const parser = createFrameStreamParser({ token: TOKEN, instanceId: "inst-1", sessionEpoch: 1 });
+	for (const chunk of written) parser.push(chunk);
+	const { openFrameId, diagnostics } = parser.snapshot();
+	assert.equal(openFrameId, null, "no open candidate after re-registration");
+	assert.equal(diagnostics.length, 0, `no protocol errors: ${JSON.stringify(diagnostics)}`);
+});
+
+test("stashed evaluator: torn-escape + stop + same-mode reactivation delivers deferred A", () => {
+	const { reporter, terminal, written, renderPass, widget } = enabledReporter({ mode: "regular" });
+	renderPass();
+	// Write OPEN + text (S emitted), then a write ending mid-escape (torn)
+	terminal.write(`${OPEN}text`);
+	terminal.write("\u001b[1;"); // torn CSI escape
+	// Stop the terminal (A deferred by pendingEscape guard, terminal nulled)
+	terminal.stop();
+	// Re-register with the SAME mode (triggers #reactivate on the EXISTING widget)
+	// Do NOT call reporter.install() — that creates a new widget. Instead, render the old widget.
+	widget.component.render(80);
+	// The deferred A for frameId 1 should now be emitted
+	const markers = written.map(decodeFrameMarker).filter(Boolean);
+	const aMarkers = markers.filter(m => m.kind === "A");
+	assert.equal(aMarkers.length, 1, "deferred A is emitted after same-mode reactivation");
+	assert.equal(aMarkers[0].frameId, 1);
+	assert.equal(reporter.state, "enabled", "capability stays enabled");
+	// Chained parser: no open candidate, no diagnostics
+	const parser = createFrameStreamParser({ token: TOKEN, instanceId: "inst-1", sessionEpoch: 1 });
+	for (const chunk of written) parser.push(chunk);
+	const { openFrameId, diagnostics } = parser.snapshot();
+	assert.equal(openFrameId, null, "no open candidate after reactivation");
+	assert.equal(diagnostics.length, 0, `no protocol errors: ${JSON.stringify(diagnostics)}`);
+});
+
+test("stashed evaluator: torn-escape + stop + same-mode install() delivers deferred A", () => {
+	const { reporter, terminal, written, renderPass } = enabledReporter({ mode: "regular" });
+	renderPass();
+	// Write OPEN + text (S emitted), then a write ending mid-escape (torn)
+	terminal.write(`${OPEN}text`);
+	terminal.write("\u001b[1;"); // torn CSI escape
+	// Stop the terminal (A deferred by pendingEscape guard, terminal nulled)
+	terminal.stop();
+	// Re-register with the SAME mode via install() (triggers #createSentinel stash-drain)
+	reporter.install();
+	// The deferred A for frameId 1 should now be emitted
+	const markers = written.map(decodeFrameMarker).filter(Boolean);
+	const aMarkers = markers.filter(m => m.kind === "A");
+	assert.equal(aMarkers.length, 1, "deferred A is emitted after same-mode install()");
+	assert.equal(aMarkers[0].frameId, 1);
+	assert.equal(reporter.state, "enabled", "capability stays enabled");
+	// Chained parser: no open candidate, no diagnostics
+	const parser = createFrameStreamParser({ token: TOKEN, instanceId: "inst-1", sessionEpoch: 1 });
+	for (const chunk of written) parser.push(chunk);
+	const { openFrameId, diagnostics } = parser.snapshot();
+	assert.equal(openFrameId, null, "no open candidate after same-mode install()");
+	assert.equal(diagnostics.length, 0, `no protocol errors: ${JSON.stringify(diagnostics)}`);
 });
