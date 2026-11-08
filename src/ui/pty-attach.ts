@@ -6,6 +6,7 @@ import { createConnection, type Socket } from "node:net";
 import type { Component, KeybindingsManager, RgbColor, TUI, TerminalColorScheme, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { CURSOR_MARKER, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { resolveAttachDeleteKey } from "../core/attach-delete.mjs";
+import { classifyProofStatus, sanitizeViewProofEnumPair } from "../core/attach-recovery.mjs";
 import { resolveAttachDetachChord } from "../core/attach-detach.mjs";
 import { createAttachScreenOwnerState, installAttachScreenOwnerObservers } from "../core/attach-screen-owner.mjs";
 import { createPtyKittyImages } from "../core/pty-kitty-images.mjs";
@@ -47,13 +48,78 @@ export interface AttachSettleDiagnosticPatch {
 	details: { probeApi?: string; outcome: string; report?: string; late?: boolean };
 }
 
+/** Issue #284 §3.4: which path settled this attach (recorded as readyReason). */
+export type AttachReadyReason = "complete" | "committed-degraded" | "legacy-settle" | "legacy-cap";
+
+/** Issue #284 §3.4/D5: recovery facts recorded at attach settle. Numbers and
+ *  finite enums only — never tokens, screen text, keys, or raw terminal data.
+ *  The committedView identity records only numeric facts: the local parser
+ *  generation (epoch) and the geometry revision; the connection/baseline
+ *  tokens stay out of the diagnostic payload, and the wire generation id and
+ *  the parser object remain excluded as non-numeric identity axes.
+ *  latestViewProof carries the whitelisted (status, reason) pair — unrecognized
+ *  wire strings map to "unrecognized" (sanitizeViewProofEnumPair). */
+export interface AttachRecoveryFacts {
+	readyReason: AttachReadyReason;
+	notReadyReason: string | null;
+	publishabilityState: string;
+	deadlineState: string;
+	witnessLatched: boolean;
+	budgetDeadline: number;
+	budgetElapsed: boolean;
+	proofStatus: string | null;
+	proofStickyInvalid: boolean;
+	committedView: {
+		generation: number;
+		geometryRevision: number;
+		source: string;
+		sourceCols: number;
+		sourceRows: number;
+		contentKind: string;
+	} | null;
+	latestViewProof: { status: string; reason: string } | null;
+}
+
+/** Diagnostic patch emitted at attach settle with the #284 recovery facts. */
+export interface AttachRecoveryDiagnosticPatch {
+	source: string;
+	level: "info";
+	code: "attach_settle_ready";
+	message: string;
+	details: AttachRecoveryFacts;
+}
+
 export interface PtyAttachOptions {
 	socketPath: string;
 	screenLogPath?: string;
 	title: string;
 	/** Issue #161: receives settle-scheme diagnostic patches. Default: no-op. */
-	onDiagnostic?: (event: AttachSettleDiagnosticPatch) => void;
+	onDiagnostic?: (event: AttachSettleDiagnosticPatch | AttachRecoveryDiagnosticPatch) => void;
+	/** Issue #284: injectable clock for attach-lifecycle deadlines. The default
+	 *  (host clock + global timers) keeps the existing behavior untouched; the
+	 *  component harness injects a virtual time source and timer queue so the
+	 *  250ms settle / 2500ms cap / 250ms recovery budget boundaries are asserted
+	 *  deterministically instead of on wall clock. */
+	clock?: AttachClock;
 }
+
+/** Issue #284 attach-lifecycle clock seam: `now` plus a scheduler pair. The
+ *  scheduled handle is opaque (the injected scheduler may return any id). */
+export interface AttachClock {
+	now(): number;
+	schedule(fn: () => void, ms: number): unknown;
+	clear(handle: unknown): void;
+}
+
+const hostAttachClock: AttachClock = {
+	now: () => Date.now(),
+	schedule: (fn, ms) => {
+		const timer = setTimeout(fn, ms);
+		timer.unref?.();
+		return timer;
+	},
+	clear: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
 
 const require = createRequire(import.meta.url);
 const { Terminal } = require("@xterm/headless") as { Terminal: new (opts: Record<string, unknown>) => XtermLike };
@@ -69,6 +135,13 @@ const LOADING_TICK_MS = 120;
 const ATTACH_SETTLE_MS = 250;
 /** Hard cap on the attach transition so a silent session can't stall the banner. */
 const ATTACH_HARD_TIMEOUT_MS = 2500;
+/** Issue #284 recovery budget: one 250ms window per attach lifetime. Once it
+ * elapses, a protocol attach with a safely committed view but no covering F
+ * proof may publish degraded (spec §3.2; the policy wiring lands with T6 —
+ * this constant only owns the timer fact). Ordinary output and reconnect
+ * re-entry never reset or extend it (invariant I5). Exported for the
+ * component harness's diagnostic readouts. */
+export const ATTACH_RECOVERY_BUDGET_MS = 250;
 /** Protocol-race guard for legacy jiggle arming (issue #91 phase 4): the
  * undecided window must not pulse the child before the snapshot probe
  * resolves — a resize-free attach is the protocol-mode contract. Invisible
@@ -192,6 +265,14 @@ interface CommittedView {
 	cursorHidden: boolean;
 	viewportTop: number | null;
 	proofSeq: number | null;
+	/** Issue #284 §3.1 predicate 7 facts, recorded at commit: which path
+	 *  captured the grid, the grid's ACTUAL dimensions (the parser size at
+	 *  commit — the readiness assembly must never re-read the current target
+	 *  here), and the locally closed completeness classification. */
+	source: "snapshot" | "sync-close";
+	sourceCols: number;
+	sourceRows: number;
+	contentKind: "complete" | "unknown";
 }
 
 /** Primitive cell snapshot used by committed rendering and interactions. */
@@ -379,13 +460,42 @@ export class PtyAttachComponent implements Component {
 	private deadlineState: "pending" | "expired" = "pending";
 	private notReadyReason: string | null = null;
 	private parserWritesInFlight = 0;
-	private readonly attachStartedAt = Date.now();
+	private readonly attachStartedAt: number;
 	private readonly viewProofTrailing = createSafeTrailingClassifier();
 	private recentProtocolOutput: Array<{ seq: number; data: string }> = [];
 	private proofResyncRequested = false;
 	/** Runner-reported reporter capability. Without it the attach keeps the
 	 *  accepted legacy deadline path (old/no-reporter hosts are not stranded). */
 	private frameWitnessAvailable = false;
+	/** Issue #284 latch layer (spec §3.3/I6): set once when frameWitnessAvailable
+	 *  first becomes true during THIS attach. Capability loss never clears it —
+	 *  the attach stays on the committed presentation path (no legacy deadline
+	 *  restore) until detach/dispose; same-component reconnects and view-layer
+	 *  invalidations (resnapshot/reset/baseline change) leave it alone. */
+	private witnessLatched = false;
+	/** Issue #284 failure-fact layer (spec §3.1.1/I6): the baseline token an
+	 *  unrecovered invalid proof classification was recorded on. The effective
+	 *  sticky state is (token === baselineToken). Recovery is PUBLISH-ONLY: a
+	 *  covered classification alone never clears it, because coverage is
+	 *  established before the full-view policy validates
+	 *  sequence/metadata/geometry/intent/identity — a wrong-geometry F would
+	 *  otherwise wash the sticky fact and re-open the degraded path. Only
+	 *  evaluateAttachReady's policy "publish" on the current baseline/identity
+	 *  (or a new baseline identity via replaceParser at an accepted
+	 *  snapshotReady, which rebinds it) clears/rebinds it. Capability loss —
+	 *  which nulls latestViewProof — deliberately keeps it. */
+	private proofInvalidatedBaselineToken: number | null = null;
+	/** Last §3.1.1 classification assembled for the policy (diagnostics/readout). */
+	private lastProofStatus: "none" | "missing" | "invalid" | "covered" | null = null;
+	/** Sticky-state twin of the classification (diagnostics/readout): mirrors
+	 *  the POST-update sticky state — (proofInvalidatedBaselineToken ===
+	 *  baselineToken) AFTER the classification applied its binding change, so
+	 *  the invalidation (false→true) and publish recovery (true→false)
+	 *  transitions are both visible to settle readouts. */
+	private lastProofStickyInvalid = false;
+	/** Issue #284 §3.4: which path settled this attach; null while still
+	 *  waiting (the wait reason stays in notReadyReason, semantics unchanged). */
+	private readyReason: AttachReadyReason | null = null;
 	/** Last complete modern projection installed at a real ?2026l boundary. */
 	private committedView: CommittedView | null = null;
 	/** Display-only same-generation/geometry recovery view; never readiness. */
@@ -409,6 +519,8 @@ export class PtyAttachComponent implements Component {
 	private desyncProbeTimer: ReturnType<typeof setInterval> | null = null;
 	/** Injectable clock for desync gating (tests override this). */
 	private nowFn: () => number = () => Date.now();
+	/** Issue #284: attach-lifecycle clock (deadlines + attach timers). */
+	private readonly clock: AttachClock;
 	private selection: MouseSelection | null = null;
 	/** Issue #172: bumped on every left press so a settle still queued for the previous
 	 * gesture cannot read or clear a selection the next press has already started. */
@@ -432,8 +544,22 @@ export class PtyAttachComponent implements Component {
 	// initial resize-jiggle redraws settle, so attach never visibly scrolls/flashes the
 	// buffer. `receivedOutput` tracks buffer content; `attaching` gates whether we paint it.
 	private attaching = true;
-	private attachSettleTimer: ReturnType<typeof setTimeout> | null = null;
-	private attachHardTimeout: ReturnType<typeof setTimeout> | null = null;
+	private attachSettleTimer: unknown = null;
+	private attachHardTimeout: unknown = null;
+	// Issue #284 recovery budget: armed ONCE per attach lifetime at the first
+	// startAttachSettle entry (deadline = attachStartedAt + 250ms). Reconnect
+	// re-entry must never re-arm or extend it (I5). The callback is fenced by
+	// the attach lifetime itself — attaching && !closed && budgetArmed — NOT by
+	// attachWaitToken: that token increments on every startAttachSettle re-entry
+	// and would permanently invalidate the armed callback after a reconnect
+	// (spec §3.2 fence lifecycle). Stale-connection views stay blocked by the
+	// identity fence (I3) instead.
+	private attachRecoveryBudgetTimer: unknown = null;
+	private budgetArmed = false;
+	/** Timer fact only: the budget deadline passed while this attach was still
+	 *  waiting. Publishing on it is the policy's decision (T6 wiring), never the
+	 *  timer's. */
+	private budgetElapsed = false;
 	// Last scheme delivered to the child at settle (issue #161). Starts null:
 	// null never matches the duplicate check, so a timeout-then-late sequence
 	// still delivers. Single-shot per attach — settle runs at most once.
@@ -469,6 +595,14 @@ export class PtyAttachComponent implements Component {
 		private readonly done: (result: PtyAttachResult) => void,
 		private readonly opts: PtyAttachOptions,
 	) {
+		// Issue #284 clock seam: assigned from the constructor parameter (not a
+		// field initializer) so it is set regardless of the loader's field-init
+		// semantics, before any attach-lifecycle deadline is computed. Output
+		// timestamps (nowFn) follow the injected clock too, so legacy deadline
+		// math never mixes virtual and wall time.
+		this.clock = opts.clock ?? hostAttachClock;
+		this.attachStartedAt = this.clock.now();
+		if (opts.clock) this.nowFn = opts.clock.now;
 		const size = this.currentSize();
 		this.cols = size.cols;
 		this.rows = size.rows;
@@ -819,7 +953,7 @@ export class PtyAttachComponent implements Component {
 			// Legacy mode: no adoption and no interaction cleanup — a Ctrl+G handoff
 			// must not destroy selection/scroll state on the raw-buffer surface.
 		}
-		if (syncCloseMarker) this.commitCommittedView(term, epoch);
+		if (syncCloseMarker) this.commitCommittedView(term, epoch, "sync-close");
 	}
 
 	/** Reinstall the ownership observers on the current parser after a hydration
@@ -957,6 +1091,13 @@ export class PtyAttachComponent implements Component {
 			this.everConnected = true;
 			this.connectionToken += 1;
 			this.committedView = null;
+			// Issue #284 view layer (I6): a connection-generation change also
+			// invalidates the old proof facts — only the new connection's
+			// snapshot/records may re-establish them. The latch survives: it is
+			// attach-scoped, not connection-scoped.
+			this.latestViewProof = null;
+			this.viewProofIdentity = null;
+			this.viewProofTrailing.reset();
 			this.currentWireGeneration = null;
 			// Do not paint the previous generation between reconnect and its
 			// confirming hello/status; same-generation status clears this gate.
@@ -1081,21 +1222,50 @@ export class PtyAttachComponent implements Component {
 	 */
 	private startAttachSettle(): void {
 		if (!this.attaching) return;
+		this.armAttachRecoveryBudget();
 		this.attachWaitToken += 1;
 		const waitToken = this.attachWaitToken;
 		this.deferAttachSettle();
-		if (this.attachHardTimeout) clearTimeout(this.attachHardTimeout);
-		const remainingHard = Math.max(0, ATTACH_HARD_TIMEOUT_MS - (Date.now() - this.attachStartedAt));
-		this.attachHardTimeout = setTimeout(() => this.handleAttachHardTimeout(waitToken), remainingHard);
-		this.attachHardTimeout.unref?.();
+		if (this.attachHardTimeout !== null) this.clock.clear(this.attachHardTimeout);
+		const remainingHard = Math.max(0, ATTACH_HARD_TIMEOUT_MS - (this.clock.now() - this.attachStartedAt));
+		this.attachHardTimeout = this.clock.schedule(() => this.handleAttachHardTimeout(waitToken), remainingHard);
+	}
+
+	/** Arm the recovery budget once per attach lifetime; every later
+	 *  startAttachSettle re-entry (reconnect) is a no-op so the deadline never
+	 *  moves (I5). */
+	private armAttachRecoveryBudget(): void {
+		if (this.budgetArmed || this.closed || !this.attaching) return;
+		this.budgetArmed = true;
+		const remaining = Math.max(0, ATTACH_RECOVERY_BUDGET_MS - (this.clock.now() - this.attachStartedAt));
+		this.attachRecoveryBudgetTimer = this.clock.schedule(() => this.handleAttachRecoveryBudgetTimeout(), remaining);
+	}
+
+	/** Budget expiry records the timer fact and re-evaluates readiness at the
+	 *  shared convergence point. The fence is the attach lifetime only (spec
+	 *  §3.2): a settled or closed component records nothing. */
+	private handleAttachRecoveryBudgetTimeout(): void {
+		this.attachRecoveryBudgetTimer = null;
+		if (!this.budgetArmed || !this.attaching || this.closed) return;
+		this.budgetElapsed = true;
+		this.evaluateAttachReady();
+	}
+
+	private clearAttachRecoveryBudget(): void {
+		if (this.attachRecoveryBudgetTimer !== null) {
+			this.clock.clear(this.attachRecoveryBudgetTimer);
+			this.attachRecoveryBudgetTimer = null;
+		}
 	}
 
 	private deferAttachSettle(): void {
-		if (!this.attaching || (this.attachMode === "protocol" && this.frameWitnessAvailable)) return;
-		if (this.attachSettleTimer) clearTimeout(this.attachSettleTimer);
+		// Protocol sessions never defer the legacy settle; a LATCHED session
+		// stays on that path even after capability loss (issue #284 I6) — a
+		// post-loss reconnect/output must not resurrect the legacy settle.
+		if (!this.attaching || this.modernCommittedMode()) return;
+		if (this.attachSettleTimer !== null) this.clock.clear(this.attachSettleTimer);
 		const waitToken = this.attachWaitToken;
-		this.attachSettleTimer = setTimeout(() => this.handleAttachSettleTimeout(waitToken), ATTACH_SETTLE_MS);
-		this.attachSettleTimer.unref?.();
+		this.attachSettleTimer = this.clock.schedule(() => this.handleAttachSettleTimeout(waitToken), ATTACH_SETTLE_MS);
 	}
 
 	/** Legacy settle callback. In protocol mode the timer is cancelled; an
@@ -1104,40 +1274,35 @@ export class PtyAttachComponent implements Component {
 		if (waitToken !== this.attachWaitToken) return;
 		this.attachSettleTimer = null;
 		if (!this.attaching || this.closed) return;
-		const legacyCompatible = this.attachMode === "legacy" || (this.attachMode === "protocol" && !this.frameWitnessAvailable);
-		if (legacyCompatible) this.finishAttachTransition();
+		// A latched protocol attach is never legacy-compatible: capability loss
+		// keeps the committed path (issue #284 I6), so this timer may not consume
+		// the transition for it.
+		const legacyCompatible = this.attachMode === "legacy" || (this.attachMode === "protocol" && !this.modernCommittedMode());
+		if (legacyCompatible) this.finishAttachTransition("legacy-settle");
 	}
 
 	/** The 2500 ms cap never forces a modern publish of an UNFINISHED frame. It
-	 * records an explicit expired/degraded wait; legacy keeps its old reveal.
-	 * Idle-session downgrade (post-#261 regression): when the cap fires with a
-	 * COMPLETE committed snapshot already hydrated, no pending geometry intent,
-	 * and the proof channel never covered this baseline (e.g. the child emitted
-	 * S and went idle, so viewProof stays unavailable/candidate-open forever),
-	 * reveal that complete runner-synthesized frame through the standard legacy
-	 * transition instead of waiting for a proof that cannot arrive. Empty
-	 * baselines and geometry-gated waits keep the original never-publish wait. */
+	 *  records an explicit expired wait and hands the decision to the readiness
+	 *  policy: the 250 ms recovery budget (armed once at attach start) has long
+	 *  elapsed by then, so the degraded chain alone decides whether a safely
+	 *  committed view may be revealed — the #265 idle-downgrade special case is
+	 *  deleted (issue #284 §3.2); the policy owns every reveal. Legacy keeps its
+	 *  old reveal. */
 	private handleAttachHardTimeout(waitToken = this.attachWaitToken): void {
 		if (waitToken !== this.attachWaitToken) return;
 		this.attachHardTimeout = null;
 		if (!this.attaching || this.closed) return;
-		const legacyCompatible = this.attachMode === "legacy" || (this.attachMode === "protocol" && !this.frameWitnessAvailable);
+		// Same latch rule as the settle timeout: a latched attach never falls
+		// back to the legacy reveal branch (issue #284 I6).
+		const legacyCompatible = this.attachMode === "legacy" || (this.attachMode === "protocol" && !this.modernCommittedMode());
 		if (legacyCompatible) {
-			this.finishAttachTransition();
+			this.finishAttachTransition("legacy-cap");
 			return;
 		}
 		this.deadlineState = "expired";
 		this.notReadyReason = this.attachMode === "protocol" ? "deadline-expired:waiting-for-complete-frame" : "deadline-expired:mode-undecided";
 		this.publishabilityState = "unknown";
-		const proof = this.latestViewProof as { status?: string } | null;
-		if (
-			this.committedView !== null &&
-			!this.resizeIntentRequired &&
-			(proof === null || proof.status !== "covered")
-		) {
-			this.finishAttachTransition();
-			return;
-		}
+		this.evaluateAttachReady();
 		this.scheduleRender();
 	}
 
@@ -1145,20 +1310,18 @@ export class PtyAttachComponent implements Component {
 	 *  not a fresh extended window. */
 	private restoreLegacyDeadlines(): void {
 		if (!this.attaching || this.closed) return;
-		const now = Date.now();
+		const now = this.clock.now();
 		if (now - this.attachStartedAt >= ATTACH_HARD_TIMEOUT_MS) {
-			this.finishAttachTransition();
+			this.finishAttachTransition("legacy-cap");
 			return;
 		}
 		const settleBase = this.lastOutputAt > 0 ? this.lastOutputAt : this.attachStartedAt;
 		const remaining = Math.max(0, ATTACH_SETTLE_MS - (now - settleBase));
-		if (this.attachSettleTimer) clearTimeout(this.attachSettleTimer);
+		if (this.attachSettleTimer !== null) this.clock.clear(this.attachSettleTimer);
 		const waitToken = this.attachWaitToken;
-		this.attachSettleTimer = setTimeout(() => this.handleAttachSettleTimeout(waitToken), remaining);
-		this.attachSettleTimer.unref?.();
-		if (!this.attachHardTimeout) {
-			this.attachHardTimeout = setTimeout(() => this.handleAttachHardTimeout(waitToken), Math.max(0, ATTACH_HARD_TIMEOUT_MS - (now - this.attachStartedAt)));
-			this.attachHardTimeout.unref?.();
+		this.attachSettleTimer = this.clock.schedule(() => this.handleAttachSettleTimeout(waitToken), remaining);
+		if (this.attachHardTimeout === null) {
+			this.attachHardTimeout = this.clock.schedule(() => this.handleAttachHardTimeout(waitToken), Math.max(0, ATTACH_HARD_TIMEOUT_MS - (now - this.attachStartedAt)));
 		}
 	}
 
@@ -1176,8 +1339,11 @@ export class PtyAttachComponent implements Component {
 	}
 
 	/** Snapshot the visible complete grid at a real close boundary. Only
-	 *  primitives are copied; no xterm BufferLine/Cell survives this call. */
-	private commitCommittedView(term: XtermLike, epoch: number): void {
+	 *  primitives are copied; no xterm BufferLine/Cell survives this call.
+	 *  `source` records which path captured the grid (spec §3.1 predicate 7):
+	 *  "snapshot" — the authoritative hydration write of a validated non-empty
+	 *  snapshot frame; "sync-close" — a locally parsed closed ?2026 sync frame. */
+	private commitCommittedView(term: XtermLike, epoch: number, source: "snapshot" | "sync-close"): void {
 		if (this.closed || this.term !== term || this.parserEpoch !== epoch) return;
 		if (!this.modernCommittedMode() || this.localHydrationState === "hydrating") return;
 		const height = this.bodyHeight();
@@ -1204,6 +1370,24 @@ export class PtyAttachComponent implements Component {
 			rows.push({ cells: new SnapshotLine(cells), kittyPrefix: kittyLines?.[lineIndex - start] ?? "" });
 		}
 		const cursor = projectPtyCursor(buf, start, height);
+		// The grid's actual dimensions at commit (duck-typed xterm read; the
+		// parser is kept at this.cols/this.rows, but the fact must come from the
+		// captured grid itself, never be re-derived from the current target at
+		// assembly time — spec §3.1 predicate 4).
+		const dims = term as { cols?: unknown; rows?: unknown };
+		const sourceCols = typeof dims.cols === "number" && dims.cols > 0 ? dims.cols : this.cols;
+		const sourceRows = typeof dims.rows === "number" && dims.rows > 0 ? dims.rows : this.rows;
+		// §3.1 predicate 7 (locally closed completeness only — no semantic
+		// boot/raw claim without an F): a snapshot commit is complete when the
+		// validated non-empty frame finished hydrating (this method early-returns
+		// while hydrating, and empty baselines never write a frame); a sync-close
+		// commit is closed by definition. Anything else fails closed to "unknown".
+		const contentKind: "complete" | "unknown" =
+			source === "snapshot"
+				? this.protocolBaselineState === "valid-content" && this.localHydrationState === "complete" ? "complete" : "unknown"
+				: source === "sync-close"
+					? "complete"
+					: "unknown";
 		this.committedView = {
 			identity: this.currentViewIdentity(),
 			start,
@@ -1213,11 +1397,19 @@ export class PtyAttachComponent implements Component {
 			cursorHidden: isPtyCursorHidden(term),
 			viewportTop: this.viewportTop,
 			proofSeq: null,
+			source,
+			sourceCols,
+			sourceRows,
+			contentKind,
 		};
 		this.recoveryView = null;
 		this.recoveryGeneration = null;
 		this.emptyResetPending = false;
 		if (this.connected) this.status = "attached";
+		// Issue #284 D4 rendezvous: a successful commit is a convergence point.
+		// A late snapshot arriving after the budget expired re-evaluates
+		// immediately instead of waiting for the next cap (spec D4).
+		this.evaluateAttachReady();
 	}
 
 	private captureRecoveryView(): void {
@@ -1248,8 +1440,11 @@ export class PtyAttachComponent implements Component {
 		return null;
 	}
 
+	/** Committed-path membership (projection, commits, recovery, selection
+	 *  source): protocol mode with the reporter capability OR the #284 latch —
+	 *  capability loss after a latched attach keeps this path alive (spec §3.3). */
 	private modernCommittedMode(): boolean {
-		return this.attachMode === "protocol" && this.frameWitnessAvailable;
+		return this.attachMode === "protocol" && (this.frameWitnessAvailable || this.witnessLatched);
 	}
 
 	/** Visible/interaction fork (issue #278): the committed projection is used in
@@ -1367,9 +1562,40 @@ export class PtyAttachComponent implements Component {
 		}
 	}
 
-	/** Pure fact assembly for the accepted decideAttachPresentation gate. */
+	/** Derive proofStatus through the §3.1.1 pure classifier and manage the
+	 *  sticky failure fact (the component-side duty of spec §3.1.1): any
+	 *  invalid classification binds to the CURRENT baseline. The classifier
+	 *  NEVER clears the binding here — recovery is publish-only (see
+	 *  evaluateAttachReady's publish branch): noteViewProofRecord(F) builds
+	 *  covered/safe-trailing coverage BEFORE the full-view policy validates
+	 *  sequence/metadata/geometry/intent/identity, so a covered classification
+	 *  on a non-publishable F must keep the degraded path blocked. A new
+	 *  baseline identity (replaceParser at an accepted snapshotReady) rebinds
+	 *  it. Capability loss (latestViewProof = null) keeps the recorded fact. */
+	private classifyLatestProof(): "none" | "missing" | "invalid" | "covered" {
+		const stickyInvalid = this.proofInvalidatedBaselineToken === this.baselineToken;
+		const proofStatus = classifyProofStatus(this.latestViewProof as Record<string, unknown> | null, stickyInvalid);
+		this.lastProofStatus = proofStatus;
+		if (proofStatus === "invalid") this.proofInvalidatedBaselineToken = this.baselineToken;
+		// The diagnostic field mirrors the POST-update sticky state (review fix):
+		// recording the pre-update value hid the invalidation transition
+		// (false→true) from every settle readout built from it.
+		this.lastProofStickyInvalid = this.proofInvalidatedBaselineToken === this.baselineToken;
+		return proofStatus;
+	}
+
+	/** Fact assembly for the accepted decideAttachPresentation gate. Issue #284
+	 *  extends the assembly with the recovery facts (spec §3.1): the policy —
+	 *  and only the policy — decides the committed-degraded publish; a timer
+	 *  fact alone never publishes. */
 	private evaluateAttachReady(): void {
-		if (!this.attaching || this.closed || this.attachMode !== "protocol" || !this.frameWitnessAvailable) return;
+		if (!this.attaching || this.closed || this.attachMode !== "protocol") return;
+		// A latched attach keeps evaluating after capability loss (I6): the
+		// committed presentation path — and with it the recovery facts — stays
+		// alive until detach/dispose. Never-latched/legacy sessions keep the
+		// legacy deadline path untouched.
+		if (!this.modernCommittedMode()) return;
+		const proofStatus = this.classifyLatestProof();
 		if (this.parserWritesInFlight > 0) return;
 		if (this.committedView === null) {
 			this.notReadyReason = "committed-view-missing";
@@ -1384,6 +1610,7 @@ export class PtyAttachComponent implements Component {
 				: this.localHydrationState === "hydrating"
 					? "hydrating"
 					: this.protocolBaselineState;
+		const committedView = this.committedView;
 		const decision = decideAttachPresentation({
 			closed: this.closed,
 			mode: this.attachMode,
@@ -1404,17 +1631,81 @@ export class PtyAttachComponent implements Component {
 			resizeIntentSatisfied: this.resizeIntentSatisfied,
 			intentId: this.resizeIntentId,
 			deadlineState: this.deadlineState,
+			// Issue #284 recovery facts (spec §3.1): plain facts recorded on the
+			// committed view and by the §3.1.1 classifier. Supplying them opts the
+			// protocol call into the degraded chain inside the policy.
+			witnessLatched: this.witnessLatched,
+			committedViewValid: this.committedViewValid(),
+			committedViewSource: committedView.source,
+			committedViewCols: committedView.sourceCols,
+			committedViewRows: committedView.sourceRows,
+			committedContentKind: committedView.contentKind,
+			proofStatus,
+			budgetElapsed: this.budgetElapsed,
 		});
 		this.notReadyReason = decision.action === "wait" ? decision.reason : null;
 		if (decision.action === "publish") {
+			// Issue #284 §3.1.1 recovery is publish-only: the covered
+			// classification precedes the full-view gates, so ONLY a policy
+			// "publish" — a fully valid F for the current baseline/identity —
+			// may clear the sticky failure fact. A wrong-geometry/intent F that
+			// merely covers the proof channel must keep the degraded path
+			// blocked (a covered-but-unpublishable F is exactly the shape the
+			// degraded chain refuses via proof-status-covered).
+			this.proofInvalidatedBaselineToken = null;
+			this.lastProofStickyInvalid = false;
 			this.publishabilityState = "ready";
-			this.finishAttachTransition();
+			this.finishAttachTransition("complete");
+		} else if (decision.action === "publish-degraded") {
+			this.publishabilityState = "ready";
+			this.finishAttachTransition("committed-degraded");
 		} else if (decision.action === "wait") {
 			this.publishabilityState = this.deadlineState === "expired" ? "unknown" : "wait";
 		}
 	}
 
-	private finishAttachTransition(): void {
+	/** Issue #284 §3.4/D5: the settle record — numbers and finite enums only
+	 *  (see AttachRecoveryFacts). Captured inside finishAttachTransition before
+	 *  the wait state resets, so it keeps the LAST wait reason. The proof pair
+	 *  is whitelisted and the committedView identity carries numeric facts
+	 *  only (parser generation/geometry revision) — tokens and raw wire strings
+	 *  never reach onDiagnostic consumers (review hardening). */
+	private buildSettleDiagnostic(source: AttachReadyReason): AttachRecoveryDiagnosticPatch {
+		const committedView = this.committedView;
+		const proof = sanitizeViewProofEnumPair(this.latestViewProof as Record<string, unknown> | null);
+		return {
+			source: "attach",
+			level: "info",
+			code: "attach_settle_ready",
+			message: `attach settle ready via ${source}`,
+			details: {
+				readyReason: source,
+				notReadyReason: this.notReadyReason,
+				publishabilityState: this.publishabilityState,
+				deadlineState: this.deadlineState,
+				witnessLatched: this.witnessLatched,
+				budgetDeadline: this.attachStartedAt + ATTACH_RECOVERY_BUDGET_MS,
+				budgetElapsed: this.budgetElapsed,
+				proofStatus: this.lastProofStatus,
+				proofStickyInvalid: this.lastProofStickyInvalid,
+				committedView: committedView === null ? null : {
+					// Numeric identity facts only: the local parser generation
+					// (the committed view's epoch — identity.parser is the current
+					// parser at every publish settle) and the geometry revision.
+					// The connection/baseline tokens are deliberately omitted.
+					generation: this.parserEpoch,
+					geometryRevision: committedView.identity.geometryRevision,
+					source: committedView.source,
+					sourceCols: committedView.sourceCols,
+					sourceRows: committedView.sourceRows,
+					contentKind: committedView.contentKind,
+				},
+				latestViewProof: proof,
+			},
+		};
+	}
+
+	private finishAttachTransition(source: AttachReadyReason): void {
 		if (!this.attaching || this.closed) return;
 		// Note: jiggle retry chain is NOT cancelled here — it survives the settle
 		// transition because any successful jiggle triggers a fullRender which emits
@@ -1425,18 +1716,25 @@ export class PtyAttachComponent implements Component {
 		// selection) is acceptable in exchange for self-healing. When the child is
 		// healthy, the very first jiggle's fullRender is detected and the chain
 		// stops before settle ends, so no post-settle jiggle fires at all.
+		// Issue #284 §3.4: record which path settled BEFORE the wait state resets
+		// (the diagnostic keeps the last wait reason; notReadyReason semantics are
+		// unchanged — null once settled).
+		const settleDiagnostic = this.buildSettleDiagnostic(source);
 		this.attaching = false;
 		this.publishabilityState = "ready";
+		this.readyReason = source;
 		this.notReadyReason = null;
+		this.opts.onDiagnostic?.(settleDiagnostic);
 		this.firstAttachSideEffectsApplied = true;
-		if (this.attachSettleTimer) {
-			clearTimeout(this.attachSettleTimer);
+		if (this.attachSettleTimer !== null) {
+			this.clock.clear(this.attachSettleTimer);
 			this.attachSettleTimer = null;
 		}
-		if (this.attachHardTimeout) {
-			clearTimeout(this.attachHardTimeout);
+		if (this.attachHardTimeout !== null) {
+			this.clock.clear(this.attachHardTimeout);
 			this.attachHardTimeout = null;
 		}
+		this.clearAttachRecoveryBudget();
 		this.stopLoadingTicker();
 		// Force a full clear so the loading banner is replaced atomically by the settled
 		// buffer, instead of diffing banner lines into buffer lines.
@@ -2337,9 +2635,12 @@ export class PtyAttachComponent implements Component {
 					if (status.frameWitness?.enabled === true) {
 						const wasAvailable = this.frameWitnessAvailable;
 						this.frameWitnessAvailable = true;
+						// Latch on the first observation of this attach (idempotent):
+						// later losses may not strand the attach on the legacy path.
+						this.witnessLatched = true;
 						if (!wasAvailable && this.attaching && this.attachMode === "protocol") {
-							if (this.attachSettleTimer) {
-								clearTimeout(this.attachSettleTimer);
+							if (this.attachSettleTimer !== null) {
+								this.clock.clear(this.attachSettleTimer);
 								this.attachSettleTimer = null;
 							}
 							this.deadlineState = "pending";
@@ -2350,9 +2651,18 @@ export class PtyAttachComponent implements Component {
 						this.latestViewProof = null;
 						this.viewProofIdentity = null;
 						if (this.attaching && this.attachMode === "protocol") {
-							this.deadlineState = "pending";
-							this.notReadyReason = "legacy-deadlines-without-reporter";
-							this.restoreLegacyDeadlines();
+							if (this.witnessLatched) {
+								// Issue #284 latch layer (I6/§3.3): a latched attach keeps the
+								// committed presentation path — no restoreLegacyDeadlines, no
+								// latch clear. Record the loss and keep waiting for safe facts;
+								// the view layer rebuilds on the next new-identity snapshot or
+								// closed frame.
+								this.notReadyReason = "witness-capability-lost";
+							} else {
+								this.deadlineState = "pending";
+								this.notReadyReason = "legacy-deadlines-without-reporter";
+								this.restoreLegacyDeadlines();
+							}
 						}
 					}
 					if (msg.type === "hello") this.editorEmpty = typeof msg.editorEmpty === "boolean" ? msg.editorEmpty : null;
@@ -2396,12 +2706,16 @@ export class PtyAttachComponent implements Component {
 				// explicit expired wait, never a forced publish.
 				this.clearJiggleStartTimer();
 				this.jiggleRetry.restoreAndStop();
-				if (this.frameWitnessAvailable && this.attachSettleTimer) {
-					clearTimeout(this.attachSettleTimer);
+				if (this.modernCommittedMode() && this.attachSettleTimer !== null) {
+					this.clock.clear(this.attachSettleTimer);
 					this.attachSettleTimer = null;
 				}
 				this.deadlineState = "pending";
-				this.notReadyReason = this.frameWitnessAvailable ? "awaiting-complete-frame" : "legacy-deadlines-without-reporter";
+				this.notReadyReason = this.frameWitnessAvailable
+					? "awaiting-complete-frame"
+					: this.witnessLatched
+						? "witness-capability-lost"
+						: "legacy-deadlines-without-reporter";
 				this.evaluateAttachReady();
 			} else if (prev === "protocol") {
 				// Downgrade after a protocol session (recovery budget exhausted):
@@ -2738,7 +3052,7 @@ export class PtyAttachComponent implements Component {
 					this.screenOwnerResyncPending = false;
 					this.resyncScreenOwnerAdapter(term, parserEpoch);
 				}
-				if (!this.parserSyncOpen) this.commitCommittedView(term, parserEpoch);
+				if (!this.parserSyncOpen) this.commitCommittedView(term, parserEpoch, "snapshot");
 			}
 			this.receivedOutput = true;
 				this.deferAttachSettle();
@@ -2826,14 +3140,21 @@ export class PtyAttachComponent implements Component {
 		// without stopping the TUI. Verified host pi 1.4.0 shape.
 		if (typeof renderSeam.renderRequested === "boolean") renderSeam.renderRequested = false;
 		this.stopDesyncProbe();
-		if (this.attachSettleTimer) {
-			clearTimeout(this.attachSettleTimer);
+		if (this.attachSettleTimer !== null) {
+			this.clock.clear(this.attachSettleTimer);
 			this.attachSettleTimer = null;
 		}
-		if (this.attachHardTimeout) {
-			clearTimeout(this.attachHardTimeout);
+		if (this.attachHardTimeout !== null) {
+			this.clock.clear(this.attachHardTimeout);
 			this.attachHardTimeout = null;
 		}
+		this.clearAttachRecoveryBudget();
+		this.budgetArmed = false;
+		// Issue #284 latch layer: the latch is attach-scoped — detach/dispose
+		// ends this attach; a new component re-observes the capability fresh.
+		this.witnessLatched = false;
+		// Same attach scope for the sticky failure fact (spec §3.1.1/I6).
+		this.proofInvalidatedBaselineToken = null;
 		this.clearGracefulSocketCloseTimer();
 		const socket = this.socket;
 		this.socket = null;
