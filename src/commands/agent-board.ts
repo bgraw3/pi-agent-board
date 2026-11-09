@@ -234,9 +234,7 @@ async function attach(
 		}).finally(() => {
 			try {
 				switchingOverlay?.hide();
-			} catch {
-				/* Best-effort overlay teardown must not mask the session switch result. */
-			}
+			} catch {}
 		});
 		if (result.cancelled) {
 			ctx.ui.notify("Attach cancelled.", "warning");
